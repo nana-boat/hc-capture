@@ -1,0 +1,25 @@
+name: HCCapture
+options:
+  bundleIdPrefix: org.hyperchat
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+targets:
+  HCCapture:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_NAME: HCCapture
+        PRODUCT_BUNDLE_IDENTIFIER: org.hyperchat.hccapture
+        INFOPLIST_FILE: Config/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
