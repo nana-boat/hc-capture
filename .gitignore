@@ -1,0 +1,8 @@
+# Keep recordings and generated files out of the repo
+Recordings/
+*.zip
+*.ipa
+__pycache__/
+build/
+*.xcodeproj/
+Payload/
