@@ -36,8 +36,9 @@ struct LiveStats {
     var fps = 0.0, accHz = 0.0
     var r: Float = 0, g: Float = 0, b: Float = 0
     var sat: Float = 0, iso: Float = 0, expMs: Float = 0
-    var ppg: [Double] = []
-    var scg: [Double] = []
+    var ppg: [Double] = []          // finger pulse, filtered 0.5-10 Hz, last 4 s
+    var scg: [Double] = []          // chest -z, filtered 5-40 Hz, last 4 s
+    var beat = LiveBeat()           // heart rate + chest beat average, last 20 s
 }
 
 struct ShareItem: Identifiable {
@@ -62,6 +63,9 @@ final class Recorder: ObservableObject {
     @Published var cuffDBP = ""
     @Published var notes = ""
     @Published var savedNote = ""
+    @Published var analysis: AnalysisResult?
+    @Published var analyzing = false
+    @Published var analysisError: String?
 
     let settleSeconds = 7.0
     private let camera = CameraPPG()
@@ -73,6 +77,9 @@ final class Recorder: ObservableObject {
     private var cameraInfo: [String: Any] = [:]
     private(set) var currentFolder: URL?
     private var meta: [String: Any] = [:]
+    private var lastSlow = 0.0
+    private var slow = LiveBeat()
+    private var liveChannel = "g"
 
     func start() async {
         errorMessage = nil
@@ -88,6 +95,8 @@ final class Recorder: ObservableObject {
             return
         }
         markers = []
+        lastSlow = 0; slow = LiveBeat(); liveChannel = "g"
+        analysis = nil; analysisError = nil; analyzing = false
         cuffSBP = ""; cuffDBP = ""; notes = ""; savedNote = ""
         UIApplication.shared.isIdleTimerDisabled = true
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
@@ -99,7 +108,7 @@ final class Recorder: ObservableObject {
         await camera.start()
         motion.start(hz: Double(accHz))
         tStart = HostClock.now
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
     }
@@ -128,20 +137,25 @@ final class Recorder: ObservableObject {
     }
 
     private func updateLive() {
-        let rp = camera.recent(seconds: 4)
-        let ra = motion.recentAcc(seconds: 4)
+        let rp = camera.recent(seconds: 5)
+        let ra = motion.recentAcc(seconds: 5)
         var s = LiveStats()
-        if let last = rp.last, let first = rp.first, rp.count > 1 {
+        if let last = rp.last, let first = rp.first, rp.count > 1, last.t > first.t {
             s.fps = Double(rp.count - 1) / (last.t - first.t)
             s.r = last.r; s.g = last.g; s.b = last.b; s.sat = last.satAny * 100; s.iso = last.iso; s.expMs = last.expMs
-            let stride = max(1, rp.count / 300)
-            s.ppg = Swift.stride(from: 0, to: rp.count, by: stride).map { -Double(rp[$0].g) }
+            s.ppg = LiveDSP.ppgWave(rp, channel: liveChannel, show: 4)
         }
-        if let last = ra.last, let first = ra.first, ra.count > 1 {
+        if let last = ra.last, let first = ra.first, ra.count > 1, last.t > first.t {
             s.accHz = Double(ra.count - 1) / (last.t - first.t)
-            let stride = max(1, ra.count / 300)
-            s.scg = Swift.stride(from: 0, to: ra.count, by: stride).map { -ra[$0].z }
+            s.scg = LiveDSP.scgWave(ra, show: 4)
         }
+        let now = HostClock.now
+        if now - lastSlow >= 1.0 {
+            lastSlow = now
+            slow = LiveDSP.beatSummary(ppg: camera.recent(seconds: 20), acc: motion.recentAcc(seconds: 20))
+            liveChannel = slow.channel
+        }
+        s.beat = slow
         live = s
     }
 
@@ -170,7 +184,7 @@ final class Recorder: ObservableObject {
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
         meta = [
-            "app": "HC Capture 0.1.0",
+            "app": "HC Capture 0.2.0",
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
             "os_version": UIDevice.current.systemVersion,
@@ -204,6 +218,23 @@ final class Recorder: ObservableObject {
         phase = .done
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         speak("Done.")
+        runAnalysis(folder)
+    }
+
+    /// Full on-phone analysis (port of hc_analyze.py). Results are also saved in the recording's analysis folder.
+    func runAnalysis(_ folder: URL) {
+        analyzing = true
+        analysisError = nil
+        analysis = nil
+        Task {
+            let r = await Analyzer.analyzeAsync(folder: folder)
+            switch r {
+            case .success(let a): self.analysis = a
+            case .failure(let e): self.analysisError = e.localizedDescription
+            }
+            self.analyzing = false
+            self.recordings = SessionStore.list()
+        }
     }
 
     func saveCuff() {
@@ -224,6 +255,8 @@ final class Recorder: ObservableObject {
         phase = .idle
         summary = []
         live = LiveStats()
+        analysis = nil
+        analysisError = nil
     }
 
     func share(_ url: URL) {
