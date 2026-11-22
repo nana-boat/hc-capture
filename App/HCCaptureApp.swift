@@ -45,7 +45,7 @@ struct SetupView: View {
             }
             Section("Camera") {
                 Picker("Lens", selection: $rec.lens) {
-                    ForEach(Lens.allCases) { Text($0.title).tag($0) }
+                    ForEach(CameraLens.allCases) { Text($0.title).tag($0) }
                 }
                 Text("Use the lens your fingertip can cover together with the flash. After Start, check the finger light bar before placing the phone.")
                     .font(.caption).foregroundColor(.secondary)

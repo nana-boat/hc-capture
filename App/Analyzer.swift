@@ -663,7 +663,7 @@ enum Analyzer {
         pd.dt = 1 / fsA
         pd.featureTimes = ep.map { $0 - t0 }
         pd.aoTimes = ea.map { $0 - t0 }
-        pd.aoValid = ea.map { _ in true }
+        pd.aoValid = [Bool](repeating: true, count: ea.count)
         return (r, pd)
     }
 

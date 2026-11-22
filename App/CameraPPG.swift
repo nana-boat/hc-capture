@@ -23,7 +23,7 @@ struct FormatPick {
 
 /// Which rear lens records the fingertip. The flash sits in a different spot from each lens,
 /// so the best lens is the one a fingertip can cover together with the flash.
-enum Lens: String, CaseIterable, Identifiable {
+enum CameraLens: String, CaseIterable, Identifiable {
     case main, ultraWide, telephoto
     var id: String { rawValue }
     var title: String {
@@ -78,7 +78,7 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     // MARK: configuration
 
-    func configure(targetFPS: Double, lens: Lens) throws -> [String: Any] {
+    func configure(targetFPS: Double, lens: CameraLens) throws -> [String: Any] {
         guard let dev = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) else {
             throw CaptureError.noLens(lens.title)
         }
@@ -148,6 +148,9 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         let minDur = CMTimeGetSeconds(f.minExposureDuration)
         maxDur = max(minDur, min(CMTimeGetSeconds(pick.frameDuration) * 0.9, CMTimeGetSeconds(f.maxExposureDuration)))
         customExposure = dev.isExposureModeSupported(.custom)
+        let torchName: String = torchDevice?.localizedName ?? "none"
+        let lensName: String = dev.localizedName
+        let lensKey: String = lens.rawValue
 
         return [
             "width": pick.width, "height": pick.height,
@@ -160,9 +163,9 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             "stabilization": "off", "pixel_format": "BGRA",
             "roi": "central 60% of frame, every 8th pixel in x and y",
             "torch": dev.hasTorch,
-            "lens": lens.rawValue,
-            "lens_name": dev.localizedName,
-            "torch_device": torchDevice?.localizedName ?? "none",
+            "lens": lensKey,
+            "lens_name": lensName,
+            "torch_device": torchName,
         ]
     }
 

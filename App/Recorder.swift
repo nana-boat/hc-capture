@@ -54,7 +54,7 @@ final class Recorder: ObservableObject {
     @Published var fps = 120
     @Published var duration = 60
     @Published var accHz = 400
-    @Published var lens: Lens = .main
+    @Published var lens: CameraLens = .main
     @Published var settle = 10
     @Published var live = LiveStats()
     @Published var errorMessage: String?
@@ -286,7 +286,8 @@ final class Recorder: ObservableObject {
 
     /// Short spoken result, because the screen faces the chest. Spoken only after recording ends.
     func spokenSummary(_ r: AnalysisResult) -> String {
-        let red = r.channels.first { $0.channel == "r" }?.mean ?? .nan
+        var red = Double.nan
+        for c in r.channels where c.channel == "r" { red = c.mean }
         if red.isFinite && red < 60 {
             return "Finger signal too dark. The flash light is not reaching the camera. Move your finger, or try another lens."
         }
