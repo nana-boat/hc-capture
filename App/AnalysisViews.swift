@@ -118,7 +118,7 @@ struct VerdictRows: View {
     var body: some View {
         Group {
             if let tap = r.tap {
-                ResultLine(label: "Taps found (accel / camera)", value: "\(tap.accTaps) / \(tap.ppgEvents)", ok: tap.paired >= 4)
+                ResultLine(label: "Taps felt / seen by camera", value: "\(tap.accTaps) / \(tap.paired)", ok: tap.accTaps >= 4 && tap.paired >= 4)
                 ResultLine(label: "Camera minus accel offset", value: "\(fmt(tap.offsetMedianMs)) ms", ok: nil)
                 ResultLine(label: "Offset spread (SD)", value: "\(fmt(tap.offsetSdMs)) ms", ok: nil)
                 Text("Do 3 repeats. A steady offset between repeats matters more than a zero offset.")
@@ -248,7 +248,7 @@ struct TapChartSection: View {
     var body: some View {
         Section("Tap signals, whole recording") {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Camera light change (orange = events found: \(p.featureTimes.count))").font(.caption)
+                Text("Camera frame-to-frame light change (orange = taps seen: \(p.featureTimes.count))").font(.caption)
                 TracePlot(values: p.light, start: p.lightStart, dx: p.lightDt, xMin: p.x0, xMax: p.x1,
                           color: .red, lines: p.featureTimes.map { VLine(x: $0, color: .orange) }, height: 90)
                 Text("Accelerometer above 5 Hz (green = taps found: \(p.aoTimes.count))").font(.caption)
@@ -260,7 +260,7 @@ struct TapChartSection: View {
                     Text("\(fmt(p.x1, "%.0f")) s")
                 }
                 .font(.caption2).foregroundColor(.secondary)
-                Text("Each tap should show as a sharp spike in both traces at about the same moment. Spikes in only one trace, or many small ones, point to weak taps or a dark finger signal.")
+                Text("Each tap should show as a sharp spike in both traces at the same moment. The small regular spikes in the camera trace are heartbeats; a tap must stand clearly above them to count.")
                     .font(.caption2).foregroundColor(.secondary)
             }
         }
@@ -287,6 +287,10 @@ struct AnalysisSections: View {
                 ResultLine(label: "Analysed span", value: "\(fmt(r.spanS)) s", ok: nil)
                 if !r.device.isEmpty { ResultLine(label: "Device", value: r.device, ok: nil) }
                 if let l = r.lens { ResultLine(label: "Camera lens", value: l, ok: nil) }
+                if let tp = r.torchPct { ResultLine(label: "Flash level", value: String(format: "%.0f%%", tp), ok: nil) }
+                if let dr = r.lightDriftPct {
+                    ResultLine(label: "Finger light drift", value: String(format: "%+.1f%%", dr), ok: r.mode == "tap" ? nil : abs(dr) <= 5)
+                }
             }
             Section("Finger pulse colour channels") {
                 ForEach(r.channels, id: \.channel) { c in

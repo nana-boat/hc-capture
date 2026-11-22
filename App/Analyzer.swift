@@ -85,6 +85,8 @@ struct PlotData: Codable {
 struct AnalysisResult: Codable {
     var version = 1
     var lens: String?
+    var torchPct: Double?
+    var lightDriftPct: Double?
     var session = ""
     var mode = ""
     var device = ""
@@ -136,6 +138,7 @@ struct SessionData {
     var device = ""
     var os = ""
     var lens = "main"
+    var torchPct: Double?
     var ppg: [String: [Double]] = [:]
     var ppgRecord: [Bool] = []
     var acc: [String: [Double]] = [:]
@@ -235,6 +238,7 @@ enum Analyzer {
         d.device = meta["device_model"] as? String ?? ""
         d.os = meta["os_version"] as? String ?? ""
         d.lens = meta["lens"] as? String ?? "main"
+        if let cam = meta["camera"] as? [String: Any], let tl = cam["torch_level"] as? Double { d.torchPct = 100 * tl }
         let p = try readCSV(folder.appendingPathComponent("ppg.csv"))
         d.ppg = p.cols
         let pn = p.cols["t"]?.count ?? 0
@@ -621,6 +625,9 @@ enum Analyzer {
         return ev
     }
 
+    /// Tap sync. Accelerometer taps are found first; then, within 0.25 s of each, the camera frame-to-frame
+    /// light change (unfiltered, so no ringing) is searched for a jump clearly bigger than a heartbeat.
+    /// Camera events are only counted next to accelerometer taps, so heartbeats can't be mistaken for taps.
     static func tapSync(at: [Double], ac: [String: [Double]], fsA: Double, P: PPG, t0: Double, t1: Double) -> (TapResult, PlotData) {
         let xs = ["x", "y", "z"].map { DSP.uniform(at, ac[$0] ?? [], fs: fsA, t0: t0, t1: t1).x }
         let n = xs.map { $0.count }.min() ?? 0
@@ -629,24 +636,51 @@ enum Analyzer {
         let hp = DSP.bandpass(mag, fs: fsA, lo: 5, hi: 0.45 * fsA).map { abs($0) }
         var ta = [Double](repeating: 0, count: hp.count)
         for i in 0..<hp.count { ta[i] = t0 + Double(i) / fsA }
-        let ea = events(hp, ta)
-        let dL = DSP.gradient(DSP.bandpass(P.rawL, fs: P.fs, lo: 0, hi: 15), fs: 1).map { abs($0) }
-        let ep = events(dL, P.rawT)
+        let ea = events(hp, ta, k: 7)
+
+        // camera: |frame-to-frame light change|, 2-frame average
+        let L = P.rawL, rt = P.rawT
+        var dL: [Double] = []
+        var tt: [Double] = []
+        if L.count > 2 && rt.count == L.count {
+            var prev = 0.0
+            for i in 0..<(L.count - 1) {
+                let d = L[i + 1] - L[i]
+                dL.append(abs(0.5 * (d + (i > 0 ? prev : 0))))
+                tt.append(rt[i + 1])
+                prev = d
+            }
+        }
+        var thr = Double.infinity
+        if !dL.isEmpty && P.hrHz.isFinite && P.hrHz > 0 && P.fs > 0 {
+            let T = 1 / P.hrHz
+            let pk = DSP.findPeaks(dL, distance: Int(0.6 * T * P.fs), wl: Int(1.5 * T * P.fs), minRelProm: 0)
+            let hb = pk.isEmpty ? DSP.median(dL) : DSP.median(pk.map { dL[$0] })
+            thr = 2.5 * hb
+        }
         var off: [Double] = []
-        if !ep.isEmpty {
-            for e in ea {
-                var bj = 0
-                var bd = Double.infinity
-                for (j, p) in ep.enumerated() where abs(p - e) < bd {
-                    bd = abs(p - e)
-                    bj = j
+        var camTimes: [Double] = []
+        for e in ea {
+            var best = -1
+            var bd = Double.infinity
+            var j = 1
+            while j < dL.count - 1 {
+                let dt = tt[j] - e
+                if dt > 0.25 { break }
+                if dt >= -0.25 && dL[j] >= thr && dL[j] >= dL[j - 1] && dL[j] >= dL[j + 1] && abs(dt) < bd {
+                    bd = abs(dt)
+                    best = j
                 }
-                if bd < 0.5 { off.append(ep[bj] - e) }
+                j += 1
+            }
+            if best >= 0 {
+                off.append(tt[best] - e)
+                camTimes.append(tt[best])
             }
         }
         var r = TapResult()
         r.accTaps = ea.count
-        r.ppgEvents = ep.count
+        r.ppgEvents = off.count
         r.paired = off.count
         r.offsetMedianMs = off.isEmpty ? .nan : 1000 * DSP.median(off)
         r.offsetSdMs = off.count > 1 ? 1000 * DSP.std(off) : .nan
@@ -656,12 +690,12 @@ enum Analyzer {
         pd.x0 = 0
         pd.x1 = t1 - t0
         pd.light = dL
-        pd.lightStart = (P.rawT.first ?? t0) - t0
+        pd.lightStart = (tt.first ?? t0) - t0
         pd.lightDt = P.fs > 0 ? 1 / P.fs : 0.01
         pd.scg = hp
         pd.start = 0
         pd.dt = 1 / fsA
-        pd.featureTimes = ep.map { $0 - t0 }
+        pd.featureTimes = camTimes.map { $0 - t0 }
         pd.aoTimes = ea.map { $0 - t0 }
         pd.aoValid = [Bool](repeating: true, count: ea.count)
         return (r, pd)
@@ -675,6 +709,7 @@ enum Analyzer {
         R.session = d.name
         R.mode = d.mode
         R.lens = d.lens
+        R.torchPct = d.torchPct
         R.device = d.device.isEmpty ? "" : "\(d.device), iOS \(d.os)"
         R.created = ISO8601DateFormatter().string(from: Date())
         let ptAll = d.ppg["t"] ?? [], atAll = d.acc["t"] ?? []
@@ -707,6 +742,22 @@ enum Analyzer {
         R.channel = P.channel
         R.hrPpg = 60 * P.hrHz
         let brightest = P.info.map { $0.mean }.max() ?? 0
+        // light drift: brightest channel, median of the first vs last 5 s (flash warming, finger pressure)
+        if let bc = P.info.max(by: { $0.mean < $1.mean }), let col = pc[bc.channel] {
+            let lb = DSP.uniform(pt, col, fs: fsP, t0: t0, t1: t1).x
+            let w = min(Int(5 * fsP), lb.count / 3)
+            if w > 10 {
+                let first = DSP.median(Array(lb[0..<w]))
+                let last = DSP.median(Array(lb[(lb.count - w)..<lb.count]))
+                if first > 1 {
+                    let drift = 100 * (last - first) / first
+                    R.lightDriftPct = drift
+                    if abs(drift) > 5 && d.mode != "tap" {
+                        R.warnings.append(String(format: "Finger light changed by %+.1f%% during the recording (flash warming up, or finger pressure changing). Pulse size and PIR may drift with it.", drift))
+                    }
+                }
+            }
+        }
         if brightest < 60 {
             R.warnings.append(String(format: "Finger signal very dark (brightest colour %.0f of 255; aim for 150 to 235). The flash light is not reaching the camera: cover the lens and the flash with one fingertip, or choose a lens closer to the flash.", brightest))
         }
@@ -715,8 +766,12 @@ enum Analyzer {
             let ts = tapSync(at: at, ac: ac, fsA: fsA, P: P, t0: t0, t1: t1)
             R.tap = ts.0
             R.plot = ts.1
-            if let tp = R.tap, tp.paired < 4 {
-                R.warnings.append("Fewer than 4 taps were found in both the camera and the accelerometer. Tap firmly, about every 4 seconds.")
+            if let tp = R.tap {
+                if tp.accTaps < 4 {
+                    R.warnings.append("Fewer than 4 taps found in the accelerometer. Tap more firmly, about every 4 seconds.")
+                } else if tp.paired < 4 {
+                    R.warnings.append("The accelerometer felt the taps but the camera barely saw them. Lift the camera fingertip about 1 cm and tap it straight back down onto the camera.")
+                }
             }
             R.text = report(R)
             try save(R, folder)
@@ -922,14 +977,15 @@ enum Analyzer {
     static func report(_ R: AnalysisResult) -> String {
         var L: [String] = []
         L.append("Session: \(R.session)")
-        L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.0)")
+        L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.1)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {
             L.append("  \(r.name.padding(toLength: 13, withPad: " ", startingAt: 0)) \(f1(r.rateHz)) Hz  jitter \(String(format: "%.2f", r.jitterMs)) ms  gaps \(r.gaps)  longest \(f1(r.longestGapMs)) ms")
         }
         if R.isoRange.count == 2 && R.expRange.count == 2 {
+            if let dr = R.lightDriftPct { L.append("  finger light drift first-to-last 5 s: \(String(format: "%+.1f", dr))%") }
             L.append("  camera ISO \(String(format: "%.0f-%.0f", R.isoRange[0], R.isoRange[1])), exposure \(String(format: "%.2f-%.2f", R.expRange[0], R.expRange[1])) ms during record (should be constant)")
         }
         L.append("")
@@ -941,7 +997,7 @@ enum Analyzer {
         if let t = R.tap {
             L.append("")
             L.append("Tap sync test")
-            L.append("  taps in accelerometer \(t.accTaps), events in PPG \(t.ppgEvents), paired \(t.paired)")
+            L.append("  taps in accelerometer \(t.accTaps), seen by the camera \(t.paired)")
             L.append("  PPG minus accelerometer offset: median \(f1(t.offsetMedianMs)) ms, SD \(f1(t.offsetSdMs)) ms")
             L.append("  (includes finger mechanics; a stable value across repeats matters more than zero)")
         } else {

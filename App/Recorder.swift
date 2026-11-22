@@ -23,9 +23,10 @@ enum Mode: String, CaseIterable, Identifiable {
                 + "pressure as usual. The phone is not on your chest, so any 'heartbeat' found in the accelerometer "
                 + "means your finger's pulse is leaking into it."
         case .tap:
-            return "Hold the phone as in Chest mode with your fingertip on the camera. Once recording starts, tap the "
-                + "back of the phone firmly next to the camera with another finger about every 4 seconds (6 to 8 taps). "
-                + "This checks camera and accelerometer timing."
+            return "Hold the phone as in Chest mode with your fingertip on the camera. Once recording starts, about every "
+                + "4 seconds lift that fingertip about 1 cm and tap it straight back down onto the camera, firmly enough "
+                + "to feel it (8 taps). Each tap shows up in both the camera and the accelerometer at the same moment, "
+                + "which checks their timing."
         }
     }
 }
@@ -55,6 +56,7 @@ final class Recorder: ObservableObject {
     @Published var duration = 60
     @Published var accHz = 400
     @Published var lens: CameraLens = .main
+    @Published var torchPct = 80
     @Published var settle = 10
     @Published var live = LiveStats()
     @Published var errorMessage: String?
@@ -91,7 +93,7 @@ final class Recorder: ObservableObject {
         }
         guard motion.accelerometerAvailable else { errorMessage = "Accelerometer not available."; return }
         do {
-            cameraInfo = try camera.configure(targetFPS: Double(fps), lens: lens)
+            cameraInfo = try camera.configure(targetFPS: Double(fps), lens: lens, torchLevel: Double(torchPct) / 100)
         } catch {
             errorMessage = error.localizedDescription
             return
@@ -193,7 +195,7 @@ final class Recorder: ObservableObject {
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
         meta = [
-            "app": "HC Capture 0.3.0",
+            "app": "HC Capture 0.3.1",
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
@@ -295,7 +297,7 @@ final class Recorder: ObservableObject {
             return "Finger signal too bright. Press a little lighter."
         }
         if let t = r.tap {
-            return "Found \(t.accTaps) taps in the accelerometer and \(t.ppgEvents) in the camera. "
+            return "Found \(t.accTaps) taps in the accelerometer. The camera saw \(t.paired). "
                 + (t.paired >= 4 ? "Good." : "Too few matched. Tap firmer, about every 4 seconds.")
         }
         var parts: [String] = []

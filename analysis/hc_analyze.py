@@ -434,32 +434,40 @@ def beat_locked(s, th, times, fs_hi, seed=0):
 
 # ----------------------------------------------------------------------------- tap sync test
 def tap_sync(acc, P, t0, t1):
+    """Accelerometer taps first; then, within 0.25 s of each, the unfiltered camera frame-to-frame light change
+    is searched for a jump clearly bigger than a heartbeat (2.5x the median heartbeat jump). Camera events are
+    only counted next to accelerometer taps, so heartbeats can't be mistaken for taps. Same as the app (0.3.1)."""
     t = acc["t"].to_numpy()
     fs = round(1 / np.median(np.diff(t)))
     mag = np.sqrt(sum(uniform(t, acc[a].to_numpy(), fs, t0, t1)[1] ** 2 for a in "xyz"))
     hp = np.abs(filt_up(mag, fs, 5, 0.45 * fs))
     ta = t0 + np.arange(len(hp)) / fs
 
-    def events(x, tt, k=8):
+    def events(x, tt, k):
         thr = np.median(x) + k * 1.4826 * np.median(np.abs(x - np.median(x)))
-        idx = np.where(x > thr)[0]
         ev = []
-        for i in idx:
+        for i in np.where(x > thr)[0]:
             if not ev or tt[i] - ev[-1] > 0.3:
                 ev.append(tt[i])
         return np.array(ev)
 
-    ea = events(hp, ta)
-    fsp = P["fs_native"]
-    dL = np.abs(np.gradient(filt_up(P["raw_L"], fsp, 0, 15)))
-    ep = events(dL, P["raw_t"])
+    ea = events(hp, ta, 7)
+    L, rt, fsp = P["raw_L"], P["raw_t"], P["fs_native"]
+    d = np.diff(L)
+    dL = np.abs(0.5 * (d + np.concatenate([[0.0], d[:-1]])))
+    tt = rt[1:]
+    T = 1 / P["hr_hz"]
+    pk = find_peaks(dL, int(0.6 * T * fsp), int(1.5 * T * fsp), 0.0)
+    thr = 2.5 * (np.median(dL[pk]) if len(pk) else np.median(dL))
     off = []
     for e in ea:
-        if len(ep):
-            j = np.argmin(np.abs(ep - e))
-            if abs(ep[j] - e) < 0.5:
-                off.append(ep[j] - e)
-    return dict(acc_taps=len(ea), ppg_events=len(ep), paired=len(off),
+        best, bd = -1, np.inf
+        for j in np.where((tt >= e - 0.25) & (tt <= e + 0.25))[0]:
+            if 0 < j < len(dL) - 1 and dL[j] >= thr and dL[j] >= dL[j - 1] and dL[j] >= dL[j + 1] and abs(tt[j] - e) < bd:
+                best, bd = j, abs(tt[j] - e)
+        if best >= 0:
+            off.append(tt[best] - e)
+    return dict(acc_taps=len(ea), ppg_events=len(off), paired=len(off),
                 offset_median_ms=1000 * float(np.median(off)) if off else np.nan,
                 offset_sd_ms=1000 * float(np.std(off)) if len(off) > 1 else np.nan)
 
@@ -502,7 +510,7 @@ def analyze(folder, channel=None, verbose=True):
     if meta.get("mode") == "tap":
         ts = tap_sync(acc, P, t0, t1)
         lines += ["", "Tap sync test",
-                  f"  taps in accelerometer {ts['acc_taps']}, events in PPG {ts['ppg_events']}, paired {ts['paired']}",
+                  f"  taps in accelerometer {ts['acc_taps']}, seen by the camera {ts['paired']}",
                   f"  PPG minus accelerometer offset: median {ts['offset_median_ms']:.1f} ms, "
                   f"SD {ts['offset_sd_ms']:.1f} ms",
                   "  (includes finger mechanics; a stable value across repeats matters more than zero)"]

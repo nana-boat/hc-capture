@@ -49,6 +49,9 @@ struct SetupView: View {
                 }
                 Text("Use the lens your fingertip can cover together with the flash. After Start, check the finger light bar before placing the phone.")
                     .font(.caption).foregroundColor(.secondary)
+                Picker("Flash level", selection: $rec.torchPct) {
+                    ForEach([70, 80, 90, 100], id: \.self) { Text("\($0)%").tag($0) }
+                }
                 Picker("Positioning time", selection: $rec.settle) {
                     ForEach([7, 10, 15], id: \.self) { Text("\($0) s").tag($0) }
                 }

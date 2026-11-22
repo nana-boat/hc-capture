@@ -67,6 +67,7 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var configured = false
     private var customExposure = false
     private var maxDur: Double = 1.0 / 60.0
+    private var torchLevel: Float = 1.0
 
     private let lock = NSLock()
     private var samples: [PPGSample] = []
@@ -78,7 +79,8 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     // MARK: configuration
 
-    func configure(targetFPS: Double, lens: CameraLens) throws -> [String: Any] {
+    func configure(targetFPS: Double, lens: CameraLens, torchLevel level: Double) throws -> [String: Any] {
+        torchLevel = Float(min(max(level, 0.1), 1.0))
         guard let dev = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) else {
             throw CaptureError.noLens(lens.title)
         }
@@ -151,6 +153,7 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         let torchName: String = torchDevice?.localizedName ?? "none"
         let lensName: String = dev.localizedName
         let lensKey: String = lens.rawValue
+        let torchLevelValue: Double = Double(torchLevel)
 
         return [
             "width": pick.width, "height": pick.height,
@@ -166,6 +169,7 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             "lens": lensKey,
             "lens_name": lensName,
             "torch_device": torchName,
+            "torch_level": torchLevelValue,
         ]
     }
 
@@ -213,9 +217,9 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         defer { dev.unlockForConfiguration() }
         if let td = torchDevice, td.hasTorch, td.isTorchModeSupported(.on) {
             if td.uniqueID == dev.uniqueID {
-                do { try dev.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) } catch { dev.torchMode = .on }
+                do { try dev.setTorchModeOn(level: min(torchLevel, AVCaptureDevice.maxAvailableTorchLevel)) } catch { dev.torchMode = .on }
             } else if (try? td.lockForConfiguration()) != nil {
-                do { try td.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) } catch { td.torchMode = .on }
+                do { try td.setTorchModeOn(level: min(torchLevel, AVCaptureDevice.maxAvailableTorchLevel)) } catch { td.torchMode = .on }
                 td.unlockForConfiguration()
             }
         }
