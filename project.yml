@@ -13,8 +13,17 @@ targets:
     sources:
       - path: App
     scheme: {}
+    preBuildScripts:
+      - name: Report Swift errors
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$SRCROOT"
+          xcrun swiftc -typecheck -sdk "$SDKROOT" -target arm64-apple-ios16.0 App/*.swift > "$TMPDIR/hc_tc.log" 2>&1 || true
+          grep -E "error:" "$TMPDIR/hc_tc.log" | sed -E 's#^.*/(App/)#\1#' | sort -u | head -9 | while IFS= read -r l; do echo "::error::$l"; done
+          exit 0
     settings:
       base:
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
         PRODUCT_NAME: HCCapture
         PRODUCT_BUNDLE_IDENTIFIER: org.hyperchat.hccapture
         INFOPLIST_FILE: Config/Info.plist
