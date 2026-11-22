@@ -103,7 +103,7 @@ enum LiveDSP {
         }
         let z = DSP.uniform(ta, acc.map { $0.z }, fs: fsA, t0: t0, t1: t1).x
         let s = DSP.bandpass(z, fs: fsA, lo: 5, hi: 40).map { -$0 }
-        let lk = DSP.beatLock(s, th0: t0, fs: fsA, times: feet)
+        let lk = DSP.beatLock(s, th0: t0, fs: fsA, times: feet, winS: (-0.4, -0.06))
         out.lock = lk.ratio
         out.n = lk.count
         out.avg = lk.template

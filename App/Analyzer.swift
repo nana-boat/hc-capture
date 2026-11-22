@@ -20,9 +20,11 @@ struct StreamRate: Codable {
 
 struct BandLock: Codable {
     var band = ""
-    var ratio = Double.nan
+    var ratio = Double.nan          // before the pulse only (60-400 ms before the finger-pulse foot)
     var snrDb = Double.nan
     var verdict = ""
+    var axis: String?              // "dv" = out of the chest (-z), "pca" = best direction. nil = analysed before 0.3.2
+    var ratioAll: Double?          // whole window (500 ms before to 100 ms after the foot)
 }
 
 struct Combo: Codable, Identifiable {
@@ -83,7 +85,7 @@ struct PlotData: Codable {
 }
 
 struct AnalysisResult: Codable {
-    var version = 1
+    var version = 2
     var lens: String?
     var torchPct: Double?
     var lightDriftPct: Double?
@@ -112,10 +114,22 @@ struct AnalysisResult: Codable {
     var tap: TapResult?
     var plot: PlotData?
     var warnings: [String] = []
+    var notes: [String]?
     var text = ""
 
+    /// The ratio decisions use: out-of-chest axis, before the pulse (older results: whatever was saved).
     var bestLock: Double {
-        let v = locks.map { $0.ratio }.filter { $0.isFinite }
+        let v = locks.filter { $0.axis == nil || $0.axis == "dv" }.map { $0.ratio }.filter { $0.isFinite }
+        return v.max() ?? .nan
+    }
+
+    /// Highest ratio in any direction and either window (shows any finger-pulse movement at all).
+    var anyLock: Double {
+        var v: [Double] = []
+        for l in locks {
+            if l.ratio.isFinite { v.append(l.ratio) }
+            if let a = l.ratioAll, a.isFinite { v.append(a) }
+        }
         return v.max() ?? .nan
     }
 }
@@ -180,7 +194,7 @@ enum Analyzer {
     static let edgeTrim = 1.0
     static let features = ["apg_peak", "tangent_foot", "max_slope"]
     static let methods = ["rule", "ensemble", "scg_first"]
-    static let fixedMethod = "ensemble", fixedAxis = "pca", fixedFeature = "tangent_foot"
+    static let fixedMethod = "ensemble", fixedAxis = "dv", fixedFeature = "tangent_foot"
 
     static func featureName(_ f: String) -> String {
         switch f {
@@ -189,6 +203,10 @@ enum Analyzer {
         default: return "max slope"
         }
     }
+
+    static func lockVerdict(_ x: Double) -> String { x > 6 ? "clear" : (x > 3 ? "weak" : "none") }
+
+    static func axisName(_ a: String?) -> String { (a ?? "pca") == "dv" ? "out-of-chest" : "best direction" }
 
     static func methodName(_ m: String) -> String {
         switch m {
@@ -625,6 +643,32 @@ enum Analyzer {
         return ev
     }
 
+    /// Accelerometer tap onsets. Jolts closer than 0.3 s belong to one burst; bursts closer than 0.5 s
+    /// (lift-off jolt + landing jolt, or a bounce) are merged, keeping the stronger one, timed at its onset.
+    static func accTapEvents(_ x: [Double], _ tt: [Double], k: Double = 7) -> [Double] {
+        let med = DSP.median(x)
+        let mad = DSP.median(x.map { abs($0 - med) })
+        let thr = med + k * 1.4826 * mad
+        var subs: [(onset: Int, peak: Double, last: Int)] = []
+        for i in 0..<min(x.count, tt.count) where x[i] > thr {
+            if let l = subs.last, tt[i] - tt[l.last] <= 0.3 {
+                subs[subs.count - 1].last = i
+                subs[subs.count - 1].peak = max(l.peak, x[i])
+            } else {
+                subs.append((i, x[i], i))
+            }
+        }
+        var out: [(onset: Int, peak: Double, last: Int)] = []
+        for sb in subs {
+            if let l = out.last, tt[sb.onset] - tt[l.onset] <= 0.5 {
+                if sb.peak > l.peak { out[out.count - 1] = sb }
+            } else {
+                out.append(sb)
+            }
+        }
+        return out.map { tt[$0.onset] }
+    }
+
     /// Tap sync. Accelerometer taps are found first; then, within 0.25 s of each, the camera frame-to-frame
     /// light change (unfiltered, so no ringing) is searched for a jump clearly bigger than a heartbeat.
     /// Camera events are only counted next to accelerometer taps, so heartbeats can't be mistaken for taps.
@@ -636,7 +680,7 @@ enum Analyzer {
         let hp = DSP.bandpass(mag, fs: fsA, lo: 5, hi: 0.45 * fsA).map { abs($0) }
         var ta = [Double](repeating: 0, count: hp.count)
         for i in 0..<hp.count { ta[i] = t0 + Double(i) / fsA }
-        let ea = events(hp, ta, k: 7)
+        let ea = accTapEvents(hp, ta)
 
         // camera: |frame-to-frame light change|, 2-frame average
         let L = P.rawL, rt = P.rawT
@@ -859,22 +903,32 @@ enum Analyzer {
             }
         }
 
-        // heartbeat check
+        // heartbeat check: only 60-400 ms before the finger pulse (where the AO is searched).
+        // Decisions use the out-of-chest axis (dv = -z); the best-direction axis is extra information.
         let okT = B.filter { $0.ok && $0.tangentFoot.isFinite }.map { $0.tangentFoot }
         for band in S.bands.sorted() {
-            guard let s = sigs[band + "|pca"] else { continue }
-            let lk = DSP.beatLock(s, th0: th0, fs: fsHi, times: okT)
-            let verdict = lk.ratio > 6 ? "clear" : (lk.ratio > 3 ? "weak" : "not detected")
-            R.locks.append(BandLock(band: band, ratio: lk.ratio, snrDb: lk.snrDb, verdict: verdict))
-        }
-        let bl = R.bestLock
-        R.scgDetected = bl > 3
-        if d.mode == "table" {
-            if bl > 3 {
-                R.warnings.append("Phone-on-table control shows a beat-locked signal: the finger pulse may be leaking into the accelerometer. Chest PTT could be contaminated.")
+            for axis in ["dv", "pca"] {
+                guard let s = sigs[band + "|" + axis] else { continue }
+                let lk = DSP.beatLock(s, th0: th0, fs: fsHi, times: okT, winS: (-pttHi, -pttLo))
+                let la = DSP.beatLock(s, th0: th0, fs: fsHi, times: okT)
+                var entry = BandLock(band: band, ratio: lk.ratio, snrDb: lk.snrDb, verdict: lockVerdict(lk.ratio))
+                entry.axis = axis
+                entry.ratioAll = la.ratio
+                R.locks.append(entry)
             }
-        } else if !(bl > 3) {
-            R.warnings.append("No heartbeat locked to the finger pulse in the chest signal. The averaged method still returns numbers from pure noise, so treat every PTT in this session as INVALID.")
+        }
+        let used = R.bestLock
+        R.scgDetected = used > 3
+        if d.mode == "table" {
+            if used > 3 {
+                R.warnings.append("The finger pulse leaks into the out-of-chest direction, in the window where the chest analysis looks for the heartbeat. Chest PTT could be contaminated: try lighter finger pressure.")
+            } else if R.anyLock > 3 {
+                R.notes = ["A small finger-pulse movement shows in another direction or just after the pulse. It falls outside what the chest analysis uses, so chest results are not affected."]
+            } else {
+                R.notes = ["No finger-pulse movement found in any direction."]
+            }
+        } else if !(used > 3) {
+            R.warnings.append("No heartbeat locked to the finger pulse in the out-of-chest chest signal. The averaged method still returns numbers from pure noise, so treat every PTT in this session as INVALID.")
         }
 
         R.hrScg = DSP.median(combos.map { $0.hrScg })
@@ -911,7 +965,7 @@ enum Analyzer {
         pd.x1 = x1
         pd.featureName = featureName(combo.feature)
         pd.label = (isFixed ? "Fixed method: " : "Most stable combination: ")
-            + "\(methodName(combo.method)), \(combo.band), \(combo.axis == "pca" ? "PCA axis" : "chest axis (-z)"), \(featureName(combo.feature))"
+            + "\(methodName(combo.method)), \(combo.band), \(combo.axis == "pca" ? "best-direction axis" : "out-of-chest axis (-z)"), \(featureName(combo.feature))"
         // raw light, native rate
         if P.fs > 0 {
             let ia = Int((x0 * P.fs).rounded(.up)), ib = min(P.rawL.count, Int(x1 * P.fs))
@@ -978,7 +1032,7 @@ enum Analyzer {
         var L: [String] = []
         L.append("Session: \(R.session)")
         L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.1)")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.2)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {
@@ -1009,15 +1063,19 @@ enum Analyzer {
                 L.append("")
                 L.append("SCG  gravity (g): x \(String(format: "%+.2f", R.gravity[0])) y \(String(format: "%+.2f", R.gravity[1])) z \(String(format: "%+.2f", R.gravity[2]))")
             }
-            for lk in R.locks {
-                L.append("  SCG \(lk.band) beat-locked ratio \(f1(lk.ratio)) (per-beat SNR \(f1(lk.snrDb)) dB) -> heartbeat \(lk.verdict)")
-            }
             if !R.locks.isEmpty {
-                L.append("  (ratio = beat-aligned average vs random-time average; >6 clear, 3-6 weak, <3 none)")
+                L.append("  Heartbeat check (beat-locked ratio: >6 clear, 3-6 weak, <3 none)")
+                L.append("    'before pulse' = only 60-400 ms before the finger pulse, where the AO is searched;")
+                L.append("    the out-of-chest axis before the pulse is what decisions use")
+            }
+            for lk in R.locks {
+                var line = "  SCG \(lk.band) \(axisName(lk.axis)): before pulse \(f1(lk.ratio)) (\(lk.verdict))"
+                if let a = lk.ratioAll { line += ", whole window \(f1(a)) (\(lockVerdict(a)))" }
+                L.append(line)
             }
             if let fx = R.fixed {
                 L.append("")
-                L.append("Fixed method (use this to compare sessions): \(methodName(fx.method)), \(fx.band), PCA axis, \(featureName(fx.feature))")
+                L.append("Fixed method (use this to compare sessions): \(methodName(fx.method)), \(fx.band), \(axisName(fx.axis)) axis, \(featureName(fx.feature))")
                 L.append("  PTT median \(f1(fx.pttMedianMs)) ms, robust SD \(f1(fx.pttRobustSdMs)) ms, IQR \(f1(fx.pttIqrMs)) ms, valid \(fx.valid)/\(fx.beats) beats, split-half \(f1(fx.splitHalfMs)) ms")
             }
             if !R.locks.isEmpty {
@@ -1034,6 +1092,10 @@ enum Analyzer {
                 L.append("Caution: choosing the 'best' row from many combinations overfits. Use pilot sessions")
                 L.append("to pick ONE combination, write it down, then judge it on new sessions only.")
             }
+        }
+        if let ns = R.notes, !ns.isEmpty {
+            L.append("")
+            for nt in ns { L.append("Note: \(nt)") }
         }
         if !R.warnings.isEmpty {
             L.append("")

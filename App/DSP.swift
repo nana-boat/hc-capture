@@ -497,16 +497,39 @@ enum DSP {
 
     /// How strongly the SCG contains a component time-locked to the finger pulse.
     /// Ratio = energy of the beat-aligned average / energy of averages at random times (about 1 = nothing).
-    static func beatLock(_ s: [Double], th0: Double, fs: Double, times: [Double], seed: UInt64 = 0)
+    /// winS = (start, end) in seconds relative to the finger-pulse foot: only look for the burst there.
+    /// Use (-0.4, -0.06), where the AO is searched, so a finger-pulse leak just after the foot can't count.
+    static func beatLock(_ s: [Double], th0: Double, fs: Double, times: [Double], seed: UInt64 = 0,
+                         winS: (Double, Double)? = nil)
         -> (snrDb: Double, ratio: Double, template: [Double], count: Int) {
         let pre = Int(0.5 * fs), post = Int(0.1 * fs)
         let segs = segments(s, th0: th0, fs: fs, times: times, pre: pre, post: post)
         guard segs.count >= 5 else { return (.nan, .nan, [], segs.count) }
         let m = columnMedian(segs)
+        let width = m.count
+        var wa = 0
+        var wb = width
+        if let win = winS {
+            wa = max(0, pre + Int((win.0 * fs).rounded()))
+            wb = min(width, pre + Int((win.1 * fs).rounded()) + 1)
+        }
+        if wb <= wa {
+            wa = 0
+            wb = width
+        }
         let w = max(1, Int(0.06 * fs))
-        func peakEnergy(_ x: [Double]) -> Double { movavg(x.map { $0 * $0 }, w).max() ?? .nan }
+        func peakEnergy(_ x: [Double]) -> Double {
+            let ex = movavg(x.map { $0 * $0 }, w)
+            var mx = -Double.infinity
+            var i = wa
+            while i < min(wb, ex.count) {
+                if ex[i] > mx { mx = ex[i] }
+                i += 1
+            }
+            return mx.isFinite ? mx : .nan
+        }
         let e = movavg(m.map { $0 * $0 }, w)
-        let j = argmax(e, 0, e.count)
+        let j = argmax(e, wa, min(wb, e.count))
         let a = max(0, j - w / 2), b = min(m.count, j + w / 2)
         var snr = Double.nan
         if b > a {

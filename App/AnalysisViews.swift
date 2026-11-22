@@ -128,8 +128,11 @@ struct VerdictRows: View {
                 ResultLine(label: "Finger beats passing quality", value: "\(r.nPpgOk) / \(r.nBeats)",
                            ok: r.nPpgOk >= Analyzer.minValidBeats)
                 if r.mode == "table" {
-                    ResultLine(label: "Finger pulse leaking into accel", value: lockText,
+                    ResultLine(label: "Leak where the chest test looks", value: lockText,
                                ok: r.bestLock.isFinite ? r.bestLock <= 3 : nil)
+                    if r.anyLock.isFinite && r.locks.contains(where: { $0.axis != nil }) {
+                        ResultLine(label: "Any finger movement (all directions)", value: "ratio \(fmt(r.anyLock))", ok: nil)
+                    }
                 } else if !r.locks.isEmpty {
                     ResultLine(label: "Heartbeat in chest signal", value: lockText, ok: r.bestLock > 6)
                 }
@@ -141,8 +144,15 @@ struct VerdictRows: View {
                     ResultLine(label: "PIR (median, CV)", value: "\(fmt(r.pirMedian, "%.3f")), \(fmt(r.pirCv))%", ok: nil)
                 }
             }
+            ForEach(r.notes ?? [], id: \.self) { nt in
+                Text(nt).font(.caption).foregroundColor(.secondary)
+            }
             ForEach(r.warnings, id: \.self) { w in
                 Text(w).font(.caption).foregroundColor(.red)
+            }
+            if r.version < 2 && r.tap == nil {
+                Text("Analysed with an older app version. Re-analyse to use the current heartbeat check.")
+                    .font(.caption).foregroundColor(.orange)
             }
         }
     }
@@ -301,10 +311,10 @@ struct AnalysisSections: View {
             }
             if !r.locks.isEmpty {
                 Section("Heartbeat check per chest band") {
-                    ForEach(r.locks, id: \.band) { l in
-                        ResultLine(label: l.band, value: "ratio \(fmt(l.ratio)) (\(l.verdict))", ok: nil)
+                    ForEach(Array(r.locks.enumerated()), id: \.offset) { item in
+                        ResultLine(label: lockLabel(item.element), value: lockValue(item.element), ok: nil)
                     }
-                    Text("Ratio = beat-aligned chest average vs averages at random times. Above 6 clear, 3 to 6 weak, below 3 none.")
+                    Text("Ratio = beat-aligned chest average vs averages at random times. Above 6 clear, 3 to 6 weak, below 3 none. 'Before' looks only 60–400 ms before the finger pulse, where the heart's opening beat is searched. The out-of-chest axis there decides the verdict.")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Section("All PTT combinations") {
@@ -328,6 +338,16 @@ struct AnalysisSections: View {
                 }
             }
         }
+    }
+}
+
+extension AnalysisSections {
+    func lockLabel(_ l: BandLock) -> String { "\(l.band) · \(Analyzer.axisName(l.axis))" }
+
+    func lockValue(_ l: BandLock) -> String {
+        var s = "before \(fmt(l.ratio))"
+        if let a = l.ratioAll { s += ", whole \(fmt(a))" }
+        return s
     }
 }
 
@@ -408,7 +428,7 @@ struct CompareRow: View {
     var detail: String {
         guard let r = item.result else { return "not analysed yet" }
         if let t = r.tap { return "tap: offset \(fmt(t.offsetMedianMs)) ms, SD \(fmt(t.offsetSdMs)) ms, \(t.paired) taps" }
-        var s = "\(r.mode) · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))"
+        var s = "\(r.mode) · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 2 ? " (old analysis)" : "")
         if r.mode == "chest", let f = r.fixed {
             s += " · PTT \(fmt(f.pttMedianMs, "%.0f")) ± \(fmt(f.pttRobustSdMs, "%.0f")) ms"
         }
@@ -434,7 +454,10 @@ struct CompareView: View {
     var body: some View {
         List {
             Section {
-                Button(running ? progress : "Analyse recordings not yet analysed") { runAll() }.disabled(running)
+                Button(running ? progress : "Analyse recordings not yet analysed") { runAll(everything: false) }.disabled(running)
+                Button("Re-analyse all recordings") { runAll(everything: true) }.disabled(running)
+                Text("After an app update, re-analyse so every recording uses the same method.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section("Chest + finger at rest") {
                 ResultLine(label: "Heartbeat detected", value: "\(detected.count) of \(chest.count) recordings", ok: nil)
@@ -471,10 +494,10 @@ struct CompareView: View {
         items = SessionStore.list().map { CompareItem(url: $0, result: Analyzer.loadSaved($0)) }
     }
 
-    @MainActor private func runAll() {
+    @MainActor private func runAll(everything: Bool) {
         running = true
         Task { @MainActor in
-            let todo = items.indices.filter { items[$0].result == nil }
+            let todo = items.indices.filter { everything || items[$0].result == nil }
             var failed = 0
             for (k, i) in todo.enumerated() {
                 progress = "Analysing \(k + 1) of \(todo.count)…"

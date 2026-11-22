@@ -195,7 +195,7 @@ final class Recorder: ObservableObject {
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
         meta = [
-            "app": "HC Capture 0.3.1",
+            "app": "HC Capture 0.3.2",
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,

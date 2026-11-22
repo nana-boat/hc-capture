@@ -406,10 +406,14 @@ def detect_ao(method, s, th, beats, feat, fs_hi, T):
     raise ValueError(method)
 
 
-def beat_locked(s, th, times, fs_hi, seed=0):
+def beat_locked(s, th, times, fs_hi, seed=0, win=None):
     """How strongly the SCG contains a component time-locked to the finger pulse.
-    Ratio = variance of the beat-aligned average / variance of an average at random times (~1 = nothing)."""
+    Ratio = energy of the beat-aligned average / energy of averages at random times (~1 = nothing).
+    win = (start, end) in s relative to the finger-pulse foot: only look for the burst there.
+    Use win=(-0.4, -0.06) (where the AO is searched) so a finger-pulse leak just after the foot can't count."""
     pre, post = int(0.5 * fs_hi), int(0.1 * fs_hi)
+    a = 0 if win is None else max(0, pre + int(round(win[0] * fs_hi)))
+    b = pre + post if win is None else min(pre + post, pre + int(round(win[1] * fs_hi)) + 1)
 
     def tmpl(ts):
         seg = []
@@ -423,8 +427,8 @@ def beat_locked(s, th, times, fs_hi, seed=0):
         return np.nan, np.nan
     m = np.median(A, axis=0)
     w = int(0.06 * fs_hi)
-    peak_e = lambda x: float(np.max(movavg(x ** 2, w)))     # energy of the strongest 60 ms burst
-    j = int(np.argmax(movavg(m ** 2, w)))
+    peak_e = lambda x: float(np.max(movavg(x ** 2, w)[a:b]))     # energy of the strongest 60 ms burst in the window
+    j = a + int(np.argmax(movavg(m ** 2, w)[a:b]))
     sl = slice(max(0, j - w // 2), j + w // 2)
     snr_db = 10 * np.log10(np.mean(m[sl] ** 2) / np.mean((A[:, sl] - m[sl]) ** 2))
     rng = np.random.default_rng(seed)
@@ -451,7 +455,23 @@ def tap_sync(acc, P, t0, t1):
                 ev.append(tt[i])
         return np.array(ev)
 
-    ea = events(hp, ta, 7)
+    # jolts < 0.3 s apart = one burst; bursts < 0.5 s apart (lift-off + landing, or a bounce) merged,
+    # keeping the stronger, timed at its onset
+    thrA = np.median(hp) + 7 * 1.4826 * np.median(np.abs(hp - np.median(hp)))
+    subs = []
+    for i in np.where(hp > thrA)[0]:
+        if subs and ta[i] - ta[subs[-1][2]] <= 0.3:
+            subs[-1][2] = i; subs[-1][1] = max(subs[-1][1], hp[i])
+        else:
+            subs.append([i, hp[i], i])
+    merged = []
+    for sb in subs:
+        if merged and ta[sb[0]] - ta[merged[-1][0]] <= 0.5:
+            if sb[1] > merged[-1][1]:
+                merged[-1] = sb
+        else:
+            merged.append(sb)
+    ea = np.array([ta[sb[0]] for sb in merged])
     L, rt, fsp = P["raw_L"], P["raw_t"], P["fs_native"]
     d = np.diff(L)
     dL = np.abs(0.5 * (d + np.concatenate([[0.0], d[:-1]])))
@@ -574,18 +594,39 @@ def analyze(folder, channel=None, verbose=True):
     C.to_csv(os.path.join(outdir, "combos.csv"), index=False)
     hr_scg = C.hr_scg.median()
     ok_t = B.tangent_foot[B.ppg_ok].dropna().to_numpy()
+    ao_win = (-CFG["ptt_range"][1], -CFG["ptt_range"][0])
+    lines.append("  Heartbeat check (beat-locked ratio: >6 clear, 3-6 weak, <3 none)")
+    lines.append("    'before pulse' = only 60-400 ms before the finger pulse, where the AO is searched;")
+    lines.append("    the out-of-chest axis (dv = -z) before the pulse is what decisions use")
+    verdict = lambda x: "clear" if x > 6 else ("weak" if x > 3 else "none")
     for band in sorted({b for b, _ in S}):
-        snr, lock = beat_locked(S[(band, "pca")][:n], th[:n], ok_t, fs_hi)
-        verdict = "clear" if lock > 6 else ("weak" if lock > 3 else "NOT DETECTED")
-        lines.append(f"  SCG {band:<9} beat-locked ratio {lock:6.1f} (per-beat SNR {snr:+.1f} dB) -> heartbeat {verdict}")
-        summary[f"scg_lock_{band}"] = lock
-    lines.append("  (ratio = beat-aligned average vs random-time average; >6 clear, 3-6 weak, <3 none.")
-    lines.append("   Run a 'phone on table' session: if it also shows a clear ratio, the finger pulse is leaking in.)")
-    best_lock = max(v for k, v in summary.items() if k.startswith("scg_lock_"))
+        for axis in ("dv", "pca"):
+            sig = S[(band, axis)][:n]
+            snr, lock = beat_locked(sig, th[:n], ok_t, fs_hi, win=ao_win)
+            _, lock_all = beat_locked(sig, th[:n], ok_t, fs_hi)
+            name = "out-of-chest" if axis == "dv" else "best direction"
+            lines.append(f"  SCG {band:<9} {name:<15} before pulse {lock:5.1f} ({verdict(lock)}), "
+                         f"whole window {lock_all:5.1f} ({verdict(lock_all)})")
+            summary[f"scg_lock_{band}_{axis}"] = lock
+            summary[f"scg_lockall_{band}_{axis}"] = lock_all
+    dv_locks = [v for k, v in summary.items() if k.startswith("scg_lock_") and k.endswith("_dv") and np.isfinite(v)]
+    any_locks = [v for k, v in summary.items() if k.startswith(("scg_lock_", "scg_lockall_")) and np.isfinite(v)]
+    best_lock = max(dv_locks) if dv_locks else np.nan
+    any_lock = max(any_locks) if any_locks else np.nan
+    summary["scg_lock_used"] = best_lock
     summary["scg_detected"] = bool(best_lock > 3)
-    if best_lock <= 3:
-        lines.append("  WARNING: no heartbeat locked to the pulse in the SCG. The averaged method still returns")
-        lines.append("  numbers from pure noise, so treat every PTT below as INVALID for this session.")
+    if meta.get("mode") == "table":
+        if best_lock > 3:
+            lines.append("  WARNING: the finger pulse leaks into the out-of-chest axis inside the AO window.")
+            lines.append("  Chest PTT could be contaminated.")
+        elif any_lock > 3:
+            lines.append("  Note: a small finger-pulse movement shows in another direction or just after the pulse.")
+            lines.append("  It falls outside what the chest analysis uses, so chest PTT is not affected.")
+        else:
+            lines.append("  No finger-pulse leak in any direction.")
+    elif not best_lock > 3:
+        lines.append("  WARNING: no heartbeat locked to the pulse in the out-of-chest SCG. The averaged method still")
+        lines.append("  returns numbers from pure noise, so treat every PTT below as INVALID for this session.")
     good = C[(C.valid >= CFG["min_valid_beats"]) & (C.yield_pct >= 50)].sort_values("ptt_robust_sd_ms")
     summary.update(hr_scg=float(hr_scg))
     lines += ["", "PTT combinations ranked by within-recording spread (lower = more stable)",
@@ -613,7 +654,7 @@ def analyze(folder, channel=None, verbose=True):
     out["valid"] = valid
     out.to_csv(os.path.join(outdir, "beats_best.csv"), index=False)
     # fixed default combination, for comparing sessions fairly
-    dflt = C[(C.method == "ensemble") & (C.axis == "pca") & (C.polarity == "+") &
+    dflt = C[(C.method == "ensemble") & (C.axis == "dv") & (C.polarity == "+") &
              (C.feature == "tangent_foot") & (C.band == C.band.iloc[0])]
     if len(dflt):
         summary["default_ptt_ms"] = float(dflt.ptt_median_ms.iloc[0])
