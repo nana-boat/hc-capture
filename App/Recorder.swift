@@ -48,7 +48,7 @@ enum BodyPlacement: String, CaseIterable, Identifiable {
         case .sternum:
             return "Bottom edge of the phone just above the bottom tip of the breastbone (where the ribs meet in a V), centred on the bone."
         case .diaphragm:
-            return "Phone centred just BELOW the bottom tip of the breastbone, on the soft area where the ribs part. Keep it flat and still, press lightly. For women this sits below the bra band."
+            return "Phone centred just BELOW the bottom tip of the breastbone, on the soft area where the ribs part. Upright or sideways (long side across the body), whichever lies flatter. Keep it flat and still, press lightly. For women this sits below the bra band."
         }
     }
 }
@@ -254,6 +254,18 @@ final class Recorder: ObservableObject {
         var g = (x: 0.0, y: 0.0, z: 0.0)
     }
 
+    /// Upright everywhere; for the diaphragm area sideways is allowed too (0.4.1).
+    private func placedOK(_ p: Pose) -> Bool {
+        p.upright || (recordPlacement == .diaphragm && p.sideways && abs(p.g.y) < 0.5)
+    }
+
+    private static func orientationName(_ g: [Double]) -> String {
+        guard g.count == 3 else { return "unknown" }
+        if g[1] < -0.6 && abs(g[0]) < 0.5 { return "upright" }
+        if abs(g[0]) >= 0.6 && abs(g[1]) < 0.5 { return "sideways" }
+        return "other"
+    }
+
     private func pose() -> Pose {
         var p = Pose()
         let a = motion.recentAcc(seconds: 1.0)
@@ -294,7 +306,7 @@ final class Recorder: ObservableObject {
         let p = pose()
         let finger = fingerPresent()
         let still = LiveDSP.shake(motion.recentAcc(seconds: 1.5)) < 0.05
-        if p.onChest && p.upright && finger {
+        if p.onChest && placedOK(p) && finger {
             if readySince == nil && still {
                 readySince = now
                 speakTip("Phone in place. Hold still. Double tap the phone when you're ready.", now)
@@ -306,9 +318,11 @@ final class Recorder: ObservableObject {
             prepStatus = "Cover the camera and the flash with your fingertip."
         } else if !p.onChest {
             prepStatus = "Finger OK. Now put the phone on your chest, screen against you."
-        } else if p.sideways {
+        } else if !placedOK(p) && recordPlacement == .diaphragm {
+            prepStatus = "Lay the phone flat below the breastbone, upright or sideways."
+        } else if p.sideways && !placedOK(p) {
             prepStatus = "Turn the phone upright, camera end towards your chin."
-        } else if !p.upright {
+        } else if !placedOK(p) {
             prepStatus = "Hold the phone upright, camera end towards your chin."
         } else {
             prepStatus = readySince == nil ? "Hold still…" : "In place. Double tap the phone to start."
@@ -332,8 +346,9 @@ final class Recorder: ObservableObject {
     private func positioningTip(_ p: Pose, finger: Bool, now: Double) -> String? {
         if !finger { return "Cover the camera and the flash with your fingertip." }
         if !p.onChest { return nil }
-        if p.sideways { return "Turn the phone upright, camera end towards your chin." }
-        if !p.upright { return "Hold the phone upright on your chest, camera end towards your chin." }
+        if !placedOK(p) && recordPlacement == .diaphragm { return "Lay the phone flat below the breastbone, upright or sideways." }
+        if p.sideways && !placedOK(p) { return "Turn the phone upright, camera end towards your chin." }
+        if !placedOK(p) { return "Hold the phone upright on your chest, camera end towards your chin." }
         guard let rs = readySince, now - rs >= 8 else { return nil }
         let l = slow.lock
         guard l.isFinite else { return nil }
@@ -356,7 +371,7 @@ final class Recorder: ObservableObject {
         checkLightAtStart()
         let p = pose()
         gravityAtStart = [p.g.x, p.g.y, p.g.z]
-        if mode == .chest && !p.upright {
+        if mode == .chest && !placedOK(p) {
             flags.append(String(format: "Phone not upright when recording started (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", p.g.x, p.g.y))
         }
         camera.freezeExposure()
@@ -496,8 +511,8 @@ final class Recorder: ObservableObject {
         let placementValue: Any = mode == .chest ? recordPlacement.rawValue : NSNull()
         let quickValue: Any = qg.isEmpty ? NSNull() : qg
         meta = [
-            "app": "HC Capture 0.4.0",
-            "analysis_version": 2,
+            "app": "HC Capture 0.4.1",
+            "analysis_version": 2.1,
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
@@ -520,11 +535,14 @@ final class Recorder: ObservableObject {
             "dropped_frames": dropped,
             "units": ["acc": "g", "gyro": "rad/s", "ppg": "mean 0-255 per channel"],
             "orientation_protocol": mode == .table ? "screen down on table"
-                : "screen against chest, phone upright; iOS reports minus the acceleration, so +z = out of chest",
+                : "screen against chest, phone upright (diaphragm area: upright or sideways); iOS reports minus the acceleration, so +z = out of chest",
             "gravity_at_start": gravityAtStart,
+            "orientation": mode == .table ? "screen down" : Recorder.orientationName(gravityAtStart),
+            "tilt": tiltInfo(gravityAtStart),
             "cuff_sbp": NSNull(), "cuff_dbp": NSNull(), "notes": "",
             "torch_level_start": Double(torchStartPct) / 100,
             "flash_raised": torchNowPct > torchStartPct,
+            "torch_level_record": Double(torchNowPct) / 100,
             "light_at_start": lightAtStart,
             "flags": flags,
             "ppg_channel_locked": ColourProfile.channel.map { $0 as Any } ?? NSNull(),
@@ -550,6 +568,17 @@ final class Recorder: ObservableObject {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         speak("Done.")
         runAnalysis(folder)
+    }
+
+    /// Phone angle at the start of the recording, from gravity (reported only).
+    /// screen_from_vertical_deg: 0 = screen vertical, 90 = phone flat. roll_deg: 0 = upright, +-90 = sideways.
+    private func tiltInfo(_ g: [Double]) -> Any {
+        guard g.count == 3 else { return NSNull() }
+        let n = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2])
+        guard n > 0.5 else { return NSNull() }
+        let screen = asin(min(1, abs(g[2]) / n)) * 180 / .pi
+        let roll = atan2(g[0], -g[1]) * 180 / .pi
+        return ["screen_from_vertical_deg": screen, "roll_deg": roll]
     }
 
     /// Full on-phone analysis (port of hc_analyze.py). Results are also saved in the recording's analysis folder.

@@ -112,6 +112,13 @@ struct SetupView: View {
                 Text("iPhones often cap the accelerometer near 100 Hz. The real rate is measured and saved.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            Section("Phone test") {
+                NavigationLink(destination: FastSensorTestView()) {
+                    Label("Fast motion-data test (about 2 min)", systemImage: "speedometer")
+                }
+                Text("Checks whether this phone can give motion data faster than about 100 a second. Phone flat on a table.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             if let e = rec.errorMessage {
                 Section { Text(e).foregroundColor(.red) }
             }

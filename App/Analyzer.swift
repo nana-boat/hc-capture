@@ -23,7 +23,7 @@ struct ChannelQuality: Codable {
     var reason = ""
 }
 
-/// Good / Weak grade of a chest recording, from the fixed method (version 2).
+/// Good / Weak grade of a chest recording, from the fixed method (version 2.1).
 struct Grade: Codable {
     var good = false
     var reasons: [String] = []
@@ -33,6 +33,9 @@ struct Grade: Codable {
     var pttMedianMs = Double.nan
     var pttSpreadMs = Double.nan
     var beats = 0
+    var method: String?             // "2.1" from app 0.4.1 (nil = graded by an older version)
+    var ptt1to20Ms: Double?         // 2.1: same fixed method at 1-20 Hz (must be within 10 ms)
+    var ptt45Ms: Double?            // 2.1: same fixed method on the first 45 s only (longer recordings)
 }
 
 struct StreamRate: Codable {
@@ -200,6 +203,7 @@ struct SessionData {
     var flashRaised: Bool?
     var placement: String?
     var extended: Bool?
+    var recordStart: Double?
     var ppg: [String: [Double]] = [:]
     var ppgRecord: [Bool] = []
     var acc: [String: [Double]] = [:]
@@ -245,6 +249,10 @@ enum Analyzer {
     /// Version 2: the 5-40 Hz band (index 1) decides the heartbeat check, the fixed PTT and the grade.
     static let fixedBandIndex = 1
     static let gradeLockMin = 6.0, gradeHalvesMin = 0.8, gradeSecondMax = 0.75, gradeSpreadMaxMs = 10.0
+    /// Version 2.1 (METHOD.md): the 1-20 Hz band and the first 45 s must agree with the main result within 10 ms.
+    static let methodVersion = "2.1"
+    static let agreeMaxMs = 10.0
+    static let firstWindowS = 45.0
 
     static func placementName(_ p: String?) -> String {
         switch p {
@@ -321,6 +329,7 @@ enum Analyzer {
         d.flashRaised = meta["flash_raised"] as? Bool
         d.placement = meta["placement"] as? String
         d.extended = meta["extended"] as? Bool
+        d.recordStart = meta["record_start_t"] as? Double
         let p = try readCSV(folder.appendingPathComponent("ppg.csv"))
         d.ppg = p.cols
         let pn = p.cols["t"]?.count ?? 0
@@ -474,7 +483,8 @@ enum Analyzer {
         var amps: [Double] = []
         for k in 0..<feet.count { amps.append(v[peaks[k]] - v[feet[k]]) }
         var ibi: [Double] = []
-        for k in 0..<(feet.count - 1) { ibi.append(Double(feet[k + 1] - feet[k]) / fs) }
+        // 2.1: beat timing from the pulse peaks (the lowest point wanders and made regular beats look irregular)
+        for k in 0..<(feet.count - 1) { ibi.append(Double(peaks[k + 1] - peaks[k]) / fs) }
         let medA = DSP.median(amps), medI = DSP.median(ibi)
         var ok = [Bool](repeating: false, count: feet.count)
         for k in 0..<feet.count {
@@ -484,10 +494,11 @@ enum Analyzer {
         q.okBeats = ok.filter { $0 }.count
         q.ibiCvPct = medI > 0 ? 100 * DSP.robustSD(ibi) / medI : .nan
         // beat shape: each clean beat (normalised) compared with the typical beat
-        let pre = Int(0.1 * T * fs), post = Int(0.6 * T * fs)
+        // 2.1: beats aligned on the pulse peak
+        let pre = Int(0.6 * T * fs), post = Int(0.4 * T * fs)
         var segs: [[Double]] = []
         for k in 0..<feet.count where ok[k] {
-            let f = feet[k]
+            let f = peaks[k]
             if f - pre < 0 || f + post > v.count { continue }
             let s = Array(v[(f - pre)..<(f + post)])
             let m = DSP.mean(s), sd = DSP.std(s)
@@ -635,27 +646,24 @@ enum Analyzer {
         return g
     }
 
-    /// Fixed method only, on raw arrays (used during recording to decide whether to extend to 60 s).
-    static func gradeFixed(pt: [Double], pc: [String: [Double]], at: [Double], ac: [String: [Double]],
-                           t0: Double, t1: Double, fsP: Double, fsA: Double, channel: String) -> Grade {
-        var bad = Grade()
+    /// Fixed method (ensemble, out of the chest, tangent foot) on one band, on raw arrays.
+    static func fixedRun(pt: [Double], pc: [String: [Double]], at: [Double], ac: [String: [Double]],
+                         t0: Double, t1: Double, fsP: Double, fsA: Double, channel: String, band: Int)
+        -> (combo: Combo, ens: EnsembleInfo?, lock: Double, error: String?) {
+        var c = Combo()
         let P = ppgProcess(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1, force: channel)
         let B = ppgBeats(P)
-        guard B.count >= 5 else {
-            bad.reasons = ["too few finger-pulse beats"]
-            return bad
-        }
+        guard B.count >= 5 else { return (c, nil, .nan, "too few finger-pulse beats") }
         let S = scgAxes(t: at, cols: ac, fs: fsA, t0: t0, t1: t1)
-        guard S.bands.count > fixedBandIndex, let full = S.sig[S.bands[fixedBandIndex] + "|dv"] else {
-            bad.reasons = ["accelerometer too slow for the 5-40 Hz band"]
-            return bad
+        guard S.bands.count > band, let full = S.sig[S.bands[band] + "|dv"] else {
+            return (c, nil, .nan, "accelerometer too slow for the \(band == fixedBandIndex ? "5-40" : "1-20") Hz band")
         }
         let n = min(full.count, P.t.count)
         let s = Array(full.prefix(n))
         var rms: [Double] = []
         for b in B {
-            let c = Int(((b.tPeak - t0) * fsHi).rounded())
-            let a = max(0, c - 500), e = min(s.count, c + 100)
+            let ci = Int(((b.tPeak - t0) * fsHi).rounded())
+            let a = max(0, ci - 500), e = min(s.count, ci + 100)
             if e > a {
                 var q = 0.0
                 for i in a..<e { q += s[i] * s[i] }
@@ -674,14 +682,61 @@ enum Analyzer {
             let p = ft[k] - res.ao[k]
             if okPre[k] && p.isFinite && p >= pttLo && p <= pttHi { pv.append(p * 1000) }
         }
-        var c = Combo()
+        c.method = fixedMethod
+        c.band = S.bands[band]
+        c.axis = fixedAxis
+        c.feature = fixedFeature
         c.valid = pv.count
         c.beats = B.count
         c.pttMedianMs = DSP.median(pv)
         c.pttRobustSdMs = DSP.robustSD(pv)
         let okT = B.filter { $0.ok && $0.tangentFoot.isFinite }.map { $0.tangentFoot }
         let lk = DSP.beatLock(s, th0: t0, fs: fsHi, times: okT, winS: (-pttHi, -pttLo))
-        return gradeFrom(lock: lk.ratio, ens: res.ens, combo: c)
+        return (c, res.ens, lk.ratio, nil)
+    }
+
+    /// 2.1: Good only if the same method at 1-20 Hz gives a PTT within 10 ms (catches the two-bump problem
+    /// instead of hiding it).
+    static func checkBands(_ g: inout Grade, ptt1to20: Double) {
+        g.method = methodVersion
+        g.ptt1to20Ms = ptt1to20
+        guard g.pttMedianMs.isFinite else { return }
+        if !ptt1to20.isFinite {
+            g.reasons.append("the 1-20 Hz check found no PTT")
+        } else if !(abs(g.pttMedianMs - ptt1to20) <= agreeMaxMs) {
+            g.reasons.append(String(format: "the two filters pick different bumps (5-40 Hz %.1f ms, 1-20 Hz %.1f ms)",
+                                    g.pttMedianMs, ptt1to20))
+        }
+        g.good = g.reasons.isEmpty
+    }
+
+    /// 2.1: Good only if the first 45 s and the whole recording agree within 10 ms (recordings longer than 50 s).
+    static func checkLength(_ g: inout Grade, ptt45: Double) {
+        g.ptt45Ms = ptt45
+        guard g.pttMedianMs.isFinite else { return }
+        if !ptt45.isFinite {
+            g.reasons.append("the first-45-s check found no PTT")
+        } else if !(abs(g.pttMedianMs - ptt45) <= agreeMaxMs) {
+            g.reasons.append(String(format: "first 45 s and whole recording disagree (%.1f vs %.1f ms)", ptt45, g.pttMedianMs))
+        }
+        g.good = g.reasons.isEmpty
+    }
+
+    /// Fixed method only, on raw arrays (used during recording to decide whether to extend to 60 s).
+    static func gradeFixed(pt: [Double], pc: [String: [Double]], at: [Double], ac: [String: [Double]],
+                           t0: Double, t1: Double, fsP: Double, fsA: Double, channel: String) -> Grade {
+        let m = fixedRun(pt: pt, pc: pc, at: at, ac: ac, t0: t0, t1: t1, fsP: fsP, fsA: fsA, channel: channel,
+                         band: fixedBandIndex)
+        if let e = m.error {
+            var bad = Grade()
+            bad.method = methodVersion
+            bad.reasons = [e]
+            return bad
+        }
+        var g = gradeFrom(lock: m.lock, ens: m.ens, combo: m.combo)
+        let o = fixedRun(pt: pt, pc: pc, at: at, ac: ac, t0: t0, t1: t1, fsP: fsP, fsA: fsA, channel: channel, band: 0)
+        checkBands(&g, ptt1to20: o.error == nil ? o.combo.pttMedianMs : .nan)
+        return g
     }
 
     /// Quick grade of the samples recorded so far (fixed method, saved or best colour).
@@ -940,7 +995,17 @@ enum Analyzer {
                 let j0 = aoI + bl
                 let lo = max(0, j0 - sn), hi = min(row.count, j0 + sn + 1)
                 let j = hi > lo ? DSP.argmax(row, lo, hi) : j0
-                ao[k] = ft[k] + Double(j - pre) / fs
+                // 2.1: sub-millisecond peak time, so the spread is not stuck in 0.74 ms steps
+                var jf = Double(j)
+                if j > 0 && j + 1 < row.count {
+                    let y0 = row[j - 1], y1 = row[j], y2 = row[j + 1]
+                    let den = y0 - 2 * y1 + y2
+                    if den < 0 {
+                        let off = 0.5 * (y0 - y2) / den
+                        if abs(off) <= 1 { jf += off }
+                    }
+                }
+                ao[k] = ft[k] + (jf - Double(pre)) / fs
             }
             return (ao, EnsembleInfo(template: tmpl, S: segs, aoI: aoI, pre: pre))
         default:   // scg_first
@@ -1267,7 +1332,7 @@ enum Analyzer {
         }
 
         // heartbeat check: only 60-400 ms before the finger pulse (where the AO is searched).
-        // Decisions use the out-of-chest axis (dv = -z); the best-direction axis is extra information.
+        // Decisions use the out-of-chest axis (dv = +z); the best-direction axis is extra information.
         let okT = B.filter { $0.ok && $0.tangentFoot.isFinite }.map { $0.tangentFoot }
         for band in S.bands.sorted() {
             for axis in ["dv", "pca"] {
@@ -1303,8 +1368,19 @@ enum Analyzer {
         let fixedKey = "\(fixedMethod)|\(fixedBand)|\(fixedAxis)|\(fixedFeature)"
         R.fixed = combos.first { $0.key == fixedKey }
         if d.mode == "chest" {
-            R.grade = gradeFrom(lock: R.bestLock, ens: ensStore[fixedKey], combo: R.fixed)
-            if R.gravity.count == 3 && !(R.gravity[1] < -0.6 && abs(R.gravity[0]) < 0.5) {
+            var g = gradeFrom(lock: R.bestLock, ens: ensStore[fixedKey], combo: R.fixed)
+            let key120 = "\(fixedMethod)|\(S.bands.first ?? "")|\(fixedAxis)|\(fixedFeature)"
+            checkBands(&g, ptt1to20: S.bands.count > 1 ? (combos.first { $0.key == key120 }?.pttMedianMs ?? .nan) : .nan)
+            if let rs = d.recordStart, min(pmax, amax) - rs > firstWindowS + 5 {
+                let t1f = min(rs + firstWindowS, pmax, amax) - edgeTrim
+                let f45 = fixedRun(pt: pt, pc: pc, at: at, ac: ac, t0: t0, t1: t1f, fsP: fsP, fsA: fsA,
+                                   channel: R.channel, band: fixedBandIndex)
+                checkLength(&g, ptt45: f45.error == nil ? f45.combo.pttMedianMs : .nan)
+            }
+            R.grade = g
+            let upright = R.gravity.count == 3 && R.gravity[1] < -0.6 && abs(R.gravity[0]) < 0.5
+            let sideways = R.gravity.count == 3 && abs(R.gravity[0]) >= 0.6 && abs(R.gravity[1]) < 0.5
+            if R.gravity.count == 3 && !(upright || (R.placement == "diaphragm" && sideways)) {
                 var fl = R.flags ?? []
                 fl.append(String(format: "Phone not upright during the recording (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", R.gravity[0], R.gravity[1]))
                 R.flags = fl
@@ -1338,7 +1414,7 @@ enum Analyzer {
         pd.x1 = x1
         pd.featureName = featureName(combo.feature)
         pd.label = (isFixed ? "Fixed method: " : "Most stable combination: ")
-            + "\(methodName(combo.method)), \(combo.band), \(combo.axis == "pca" ? "best-direction axis" : "out-of-chest axis (-z)"), \(featureName(combo.feature))"
+            + "\(methodName(combo.method)), \(combo.band), \(combo.axis == "pca" ? "best-direction axis" : "out-of-chest axis (+z)"), \(featureName(combo.feature))"
         // raw light, native rate
         if P.fs > 0 {
             let ia = Int((x0 * P.fs).rounded(.up)), ib = min(P.rawL.count, Int(x1 * P.fs))
@@ -1405,7 +1481,7 @@ enum Analyzer {
         var L: [String] = []
         L.append("Session: \(R.session)")
         L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.4.0, analysis version 2)")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.4.1, analysis version 2.1)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {
@@ -1465,6 +1541,11 @@ enum Analyzer {
                 L.append("")
                 L.append("GRADE: \(g.good ? "GOOD" : "WEAK")  (placement: \(placementName(R.placement))\((R.extended ?? false) ? ", extended to 60 s" : ""))")
                 L.append("  PTT \(f1(g.pttMedianMs)) ms, spread \(f1(g.pttSpreadMs)) ms, beats \(g.beats), heartbeat ratio \(f1(g.lock)), halves match \(String(format: "%.2f", g.halvesMatch)), second bump \(String(format: "%.2f", g.secondPeak))")
+                if g.method != nil {
+                    let b = g.ptt1to20Ms.map { f1($0) } ?? "–"
+                    let w = g.ptt45Ms.map { f1($0) } ?? "not needed"
+                    L.append("  2.1 checks: 1-20 Hz PTT \(b) ms, first 45 s PTT \(w) ms (each must be within \(f1(agreeMaxMs)) ms)")
+                }
                 for r in g.reasons { L.append("  - \(r)") }
             }
             if let fx = R.fixed {
