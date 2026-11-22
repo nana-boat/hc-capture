@@ -44,13 +44,30 @@ struct SetupView: View {
                 Text(rec.mode.instructions).font(.callout)
             }
             Section("Camera") {
-                Picker("Lens", selection: $rec.lens) {
-                    ForEach(CameraLens.allCases) { Text($0.title).tag($0) }
+                LensChooser(rec: rec)
+                HStack {
+                    Text("Flash")
+                    Spacer()
+                    Text("starts at \(rec.torchStartPct)%, automatic").foregroundColor(.secondary)
                 }
-                Text("Use the lens your fingertip can cover together with the flash. After Start, check the finger light bar before placing the phone.")
+                Text("If your finger is too dim while you position it, the flash is raised automatically (up to 100%). It never changes during the recording.")
                     .font(.caption).foregroundColor(.secondary)
-                Picker("Flash level", selection: $rec.torchPct) {
-                    ForEach([70, 80, 90, 100], id: \.self) { Text("\($0)%").tag($0) }
+                HStack {
+                    Text("Finger colour")
+                    Spacer()
+                    Text(rec.colourChannel == nil ? "automatic, not chosen yet" : "\(ColourProfile.name(rec.colourChannel)), chosen automatically")
+                        .foregroundColor(.secondary)
+                }
+                Text(rec.colourChannel == nil
+                     ? "Chosen automatically on your first chest or table recording with a clean pulse, then kept for every recording."
+                     : "Kept for every recording. Chosen again automatically only if it fails 3 recordings in a row.")
+                    .font(.caption).foregroundColor(.secondary)
+                if rec.colourChannel != nil {
+                    Button("Choose finger colour again (new person on this phone)") { rec.resetColour() }
+                        .font(.callout)
+                }
+                if !rec.colourMessage.isEmpty {
+                    Text(rec.colourMessage).font(.caption).foregroundColor(.orange)
                 }
                 Picker("Positioning time", selection: $rec.settle) {
                     ForEach([7, 10, 15], id: \.self) { Text("\($0) s").tag($0) }
@@ -159,7 +176,8 @@ struct RunView: View {
                 }
                 .padding(.horizontal)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Lens: \(rec.lens.title)")
+                    Text("Lens: \(rec.lens.title)   Flash: \(rec.torchNowPct)%" + (rec.torchNowPct > rec.torchStartPct ? " (raised)" : ""))
+                    Text("Finger colour: \(rec.colourChannel == nil ? "automatic" : ColourProfile.name(rec.colourChannel))")
                     Text(String(format: "Camera %.0f fps   Accelerometer %.0f Hz", rec.live.fps, rec.live.accHz))
                     Text(String(format: "R %.0f  G %.0f  B %.0f   saturated %.1f%%", rec.live.r, rec.live.g, rec.live.b, rec.live.sat))
                     Text(String(format: "ISO %.0f   exposure %.2f ms", rec.live.iso, rec.live.expMs))
@@ -177,6 +195,47 @@ struct RunView: View {
         }
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
+    }
+}
+
+/// Rear lenses: only the ones this iPhone has can be chosen; the rest are greyed out.
+struct LensChooser: View {
+    @ObservedObject var rec: Recorder
+
+    var body: some View {
+        if CameraLens.available.count <= 1 {
+            HStack {
+                Text("Lens")
+                Spacer()
+                Text("\(rec.lens.title), the only rear camera").foregroundColor(.secondary)
+            }
+        } else {
+            ForEach(CameraLens.allCases) { l in
+                Button {
+                    rec.lens = l
+                } label: {
+                    HStack {
+                        Text(l.title)
+                            .foregroundColor(l.isAvailable ? Color.primary : Color.secondary)
+                        Spacer()
+                        Text(lensNote(l)).font(.caption).foregroundColor(.secondary)
+                        if rec.lens == l {
+                            Image(systemName: "checkmark").foregroundColor(.accentColor)
+                        }
+                    }
+                }
+                .disabled(!l.isAvailable)
+            }
+            Text("Choose the lens your fingertip can cover together with the flash (the phone can't tell which one is nearest). Your choice is remembered for every recording on this phone.")
+                .font(.caption).foregroundColor(.secondary)
+        }
+    }
+
+    func lensNote(_ l: CameraLens) -> String {
+        if !l.isAvailable { return "not on this phone" }
+        let f = CameraLens.maxFPS[l] ?? 0
+        if f > 0 && f < 119 { return String(format: "max %.0f fps", f) }
+        return ""
     }
 }
 

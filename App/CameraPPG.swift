@@ -42,6 +42,40 @@ enum CameraLens: String, CaseIterable, Identifiable {
     }
 }
 
+extension CameraLens {
+    var device: AVCaptureDevice? { AVCaptureDevice.default(deviceType, for: .video, position: .back) }
+
+    /// Lenses this iPhone actually has, found once at launch.
+    static let available: [CameraLens] = CameraLens.allCases.filter { $0.device != nil }
+
+    /// Highest frame rate each lens offers (frames at least 640 px wide). 0 = lens missing.
+    static let maxFPS: [CameraLens: Double] = {
+        var out: [CameraLens: Double] = [:]
+        for l in CameraLens.allCases {
+            var best = 0.0
+            if let d = l.device {
+                for f in d.formats {
+                    let dim = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                    if dim.width < 640 { continue }
+                    for r in f.videoSupportedFrameRateRanges where r.maxFrameRate > best { best = r.maxFrameRate }
+                }
+            }
+            out[l] = best
+        }
+        return out
+    }()
+
+    var isAvailable: Bool { CameraLens.available.contains(self) }
+
+    /// The lens chosen last time, if this phone has it; otherwise the first lens it has.
+    static func remembered() -> CameraLens {
+        if let s = UserDefaults.standard.string(forKey: "hc.lens"), let l = CameraLens(rawValue: s), l.isAvailable {
+            return l
+        }
+        return CameraLens.available.first ?? .main
+    }
+}
+
 enum CaptureError: LocalizedError {
     case noCamera, cannotAddInput, cannotAddOutput, noFormat
     case noLens(String)
@@ -230,6 +264,25 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         } else if dev.isExposureModeSupported(.continuousAutoExposure) {
             dev.exposureMode = .continuousAutoExposure
         }
+    }
+
+    /// Change the flash level (used only while positioning; it stays fixed during the recording).
+    func setTorch(level: Double) {
+        torchLevel = Float(min(max(level, 0.1), 1.0))
+        let lvl = torchLevel
+        sessionQueue.async {
+            guard let td = self.torchDevice, td.hasTorch, td.isTorchModeSupported(.on) else { return }
+            guard (try? td.lockForConfiguration()) != nil else { return }
+            do { try td.setTorchModeOn(level: min(lvl, AVCaptureDevice.maxAvailableTorchLevel)) } catch { }
+            td.unlockForConfiguration()
+        }
+    }
+
+    /// True when the camera can't get any brighter by itself (longest exposure and highest ISO reached).
+    var atSensitivityLimit: Bool {
+        guard let dev = device, customExposure else { return true }
+        let f = dev.activeFormat
+        return dev.iso >= f.maxISO * 0.95 && CMTimeGetSeconds(dev.exposureDuration) >= maxDur * 0.95
     }
 
     /// Stop adapting exposure; from here on camera settings stay fixed.

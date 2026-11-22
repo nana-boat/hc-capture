@@ -59,7 +59,7 @@ enum LiveDSP {
 
     /// Heart rate, and the chest signal averaged around each finger-pulse foot (shows whether the
     /// heartbeat is reaching the accelerometer while you adjust the phone).
-    static func beatSummary(ppg: [PPGSample], acc: [XYZSample]) -> LiveBeat {
+    static func beatSummary(ppg: [PPGSample], acc: [XYZSample], channel: String? = nil) -> LiveBeat {
         var out = LiveBeat()
         guard ppg.count > 50, acc.count > 50,
               let p0 = ppg.first?.t, let p1 = ppg.last?.t,
@@ -76,7 +76,8 @@ enum LiveDSP {
         // pick the colour channel with the strongest pulse
         var bestCh = "g", bestScore = -1.0
         var bestL: [Double] = []
-        for ch in ["g", "r"] {
+        let candidates: [String] = channel.map { [$0] } ?? ["g", "r"]
+        for ch in candidates {
             let L = DSP.uniform(tp, ppg.map { value($0, ch) }, fs: fsP, t0: t0, t1: t1).x
             let mu = DSP.mean(L)
             let ac = DSP.bandpass(L, fs: fsP, lo: 0.7, hi: 3.5)

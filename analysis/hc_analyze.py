@@ -253,6 +253,102 @@ def ppg_beats(P, fs_hi):
     return B
 
 
+# ----------------------------------------------------------------------------- finger colour quality
+def channel_quality(t, x, fs, t0, t1):
+    """Is this colour a real, clean heartbeat and not noise? Same checks as the app (0.3.3)."""
+    tg, L = uniform(t, x, fs, t0, t1)
+    q = dict(mean=float(np.mean(L)), beats=0, ok=0, peak_ratio=0.0, ibi_cv=np.nan, shape=np.nan, agree=None)
+    if len(L) < 10 * fs:
+        return q, np.array([])
+    ac = filt_up(L, fs, 0.7, 3.5)
+    if np.std(ac) > 0:
+        F = np.abs(np.fft.rfft(ac * np.hanning(len(ac))))
+        f = np.fft.rfftfreq(len(ac), 1 / fs)
+        band = (f > 0.7) & (f < 3.5)
+        q["peak_ratio"] = float(F[band].max() / (np.median(F[band]) + 1e-12))
+    v = -filt_up(L, fs, 0.5, 10)
+    hr = dominant_hr(v, fs)
+    T = 1 / hr
+    feet, peaks = [], []
+    for i in find_peaks(v, int(0.6 * T * fs), int(1.5 * T * fs), 0.3):
+        a = max(0, i - int(0.5 * T * fs))
+        if i - a < 3:
+            continue
+        f0 = a + int(np.argmin(v[a:i]))
+        if i - f0 < 2:
+            continue
+        feet.append(f0); peaks.append(i)
+    feet, peaks = np.array(feet), np.array(peaks)
+    q["beats"] = len(feet)
+    if len(feet) < 5:
+        return q, np.array([])
+    amps = v[peaks] - v[feet]
+    ibi = np.diff(feet) / fs
+    mA, mI = np.median(amps), np.median(ibi)
+    ib = np.append(ibi, np.nan)
+    ok = (amps > 0.4 * mA) & (amps < 2.5 * mA) & (np.isnan(ib) | (np.abs(ib - mI) < 0.25 * mI))
+    q["ok"] = int(ok.sum())
+    q["ibi_cv"] = 100 * robust_sd(ibi) / mI
+    pre, post = int(0.1 * T * fs), int(0.6 * T * fs)
+    segs = []
+    for f0 in feet[ok]:
+        if f0 - pre >= 0 and f0 + post <= len(v):
+            s = v[f0 - pre:f0 + post]
+            if np.std(s) > 0:
+                segs.append((s - s.mean()) / s.std())
+    if len(segs) >= 5:
+        S = np.array(segs)
+        tm = np.median(S, axis=0)
+        if np.std(tm) > 0:
+            q["shape"] = float(np.median(S @ ((tm - tm.mean()) / tm.std()) / S.shape[1]))
+    return q, t0 + feet[ok] / fs
+
+
+def judge(q):
+    why = []
+    if not q["mean"] >= 10: why.append("too dark")
+    if q["mean"] > 245: why.append("too bright")
+    if q["ok"] < 15: why.append("too few clean beats")
+    elif q["ok"] < 0.6 * q["beats"]: why.append("many irregular beats")
+    if not q["peak_ratio"] >= 5: why.append("heartbeat rhythm not clear")
+    if not q["ibi_cv"] <= 15: why.append("beat timing irregular")
+    if not q["shape"] >= 0.8: why.append("beat shape inconsistent")
+    if q["agree"] is not None and q["agree"] < 70: why.append("beats don't match the other colour")
+    q["passed"] = not why
+    q["reason"] = ", ".join(why)
+
+
+def assess_colours(ppg, t0, t1):
+    t = ppg["t"].to_numpy()
+    fs = round(1 / np.median(np.diff(t)))
+    Q, F = {}, {}
+    for c in "rgb":
+        Q[c], F[c] = channel_quality(t, ppg[c].to_numpy(), fs, t0, t1)
+        judge(Q[c])
+    for c, o in (("r", "g"), ("g", "r")):
+        if Q[o]["passed"] and len(F[c]):
+            Q[c]["agree"] = 100 * float(np.mean([np.min(np.abs(F[o] - x)) <= 0.05 for x in F[c]]))
+    for c in "rgb":
+        judge(Q[c])
+    return Q
+
+
+def best_colour(Q):
+    """Most consistent beat shape; if within 0.02, larger share of clean beats; if within 2 points, clearer rhythm."""
+    import functools
+    passing = [c for c in "rgb" if Q[c]["passed"]]
+    share = lambda c: Q[c]["ok"] / Q[c]["beats"] if Q[c]["beats"] else 0
+
+    def cmp(a, b):
+        if abs(Q[a]["shape"] - Q[b]["shape"]) > 0.02:
+            return -1 if Q[a]["shape"] > Q[b]["shape"] else 1
+        if abs(share(a) - share(b)) > 0.02:
+            return -1 if share(a) > share(b) else 1
+        return -1 if Q[a]["peak_ratio"] > Q[b]["peak_ratio"] else 1
+    passing.sort(key=functools.cmp_to_key(cmp))
+    return passing[0] if passing else None
+
+
 # ----------------------------------------------------------------------------- SCG
 def scg_axes(acc, t0, t1, fs_hi):
     t = acc["t"].to_numpy()
@@ -515,17 +611,45 @@ def analyze(folder, channel=None, verbose=True):
         lines.append(f"  camera ISO {ppg.iso.min():.0f}-{ppg.iso.max():.0f}, exposure "
                      f"{ppg.exp_ms.min():.2f}-{ppg.exp_ms.max():.2f} ms during record (should be constant)")
 
-    P = ppg_process(ppg, t0, t1, fs_hi, channel)
+    Q = assess_colours(ppg, t0, t1)
+    flags = list(meta.get("flags") or [])
+    locked = meta.get("ppg_channel_locked")
+    if channel:
+        source, use = "forced on the command line", channel
+    elif locked in ("r", "g", "b"):
+        source, use = "saved colour", locked
+    else:
+        use = best_colour(Q)
+        source = "chosen now" if use else "none passed; best available used"
+    P = ppg_process(ppg, t0, t1, fs_hi, use)
+    qu = Q[P["channel"]]
+    if meta.get("mode") != "tap":
+        if source == "saved colour" and not qu["passed"]:
+            flags.append(f"The saved finger colour ({P['channel']}) failed the quality check: {qu['reason']}.")
+        elif use is None:
+            flags.append(f"The finger pulse failed the quality check in every colour ({P['channel']}: {qu['reason']}). "
+                         "Results are unreliable.")
     lines.append("")
     lines.append("PPG channels (mean 0-255, pulsatility = AC/DC, peak ratio = heartbeat clarity)")
     for c, d in P["channel_info"].items():
         lines.append(f"  {c}: mean {d['mean']:6.1f}  pulsatility {d['pulsatility_pct']:.2f}%  "
                      f"peak ratio {d['spectral_peak_ratio']:.1f}" + ("   <- used" if c == P["channel"] else ""))
     lines.append(f"  PPG heart rate {60 * P['hr_hz']:.1f} bpm")
+    lines.append(f"  Colour used: {P['channel']} ({source})")
+    lines.append("  Quality per colour (clean beats, rhythm clarity, timing variation, beat shape, match with other colour):")
+    for c in "rgb":
+        q = Q[c]
+        ag = "not checked" if q["agree"] is None else f"{q['agree']:.0f}%"
+        lines.append(f"    {c}: {q['ok']}/{q['beats']}, clarity {q['peak_ratio']:.1f}, timing {q['ibi_cv']:.1f}%, "
+                     f"shape {q['shape']:.3f}, match {ag} -> " + ("pass" if q["passed"] else "fail: " + q["reason"]))
+    for f in flags:
+        lines.append(f"  FLAGGED: {f}")
     summary = dict(session=os.path.basename(os.path.normpath(folder)), mode=meta.get("mode"),
                    cuff_sbp=meta.get("cuff_sbp"), cuff_dbp=meta.get("cuff_dbp"),
                    hr_ppg=60 * P["hr_hz"], ppg_channel=P["channel"],
-                   cam_hz=rep[0]["rate_hz"], acc_hz=rep[1]["rate_hz"])
+                   cam_hz=rep[0]["rate_hz"], acc_hz=rep[1]["rate_hz"],
+                   colour_source=source, colour_passed=bool(qu["passed"]), flagged=bool(flags),
+                   colour_setup=meta.get("colour_setup"))
 
     if meta.get("mode") == "tap":
         ts = tap_sync(acc, P, t0, t1)

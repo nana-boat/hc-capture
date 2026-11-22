@@ -9,6 +9,20 @@ struct ChannelInfo: Codable {
     var peakRatio = 0.0
 }
 
+/// Finger-pulse quality for one colour: is this a real, clean heartbeat and not noise?
+struct ChannelQuality: Codable {
+    var channel = ""
+    var mean = 0.0                // brightness 0-255
+    var beats = 0                 // pulses found
+    var okBeats = 0               // pulses with normal size and timing
+    var peakRatio = 0.0           // rhythm clarity (one steady heart rate)
+    var ibiCvPct = Double.nan     // beat-to-beat timing variation, %
+    var shapeCorr = Double.nan    // how alike the beats look (1 = identical)
+    var agreementPct: Double?     // % of beats also found in the other colour (nil = not checked)
+    var passed = false
+    var reason = ""
+}
+
 struct StreamRate: Codable {
     var name = ""
     var n = 0
@@ -115,7 +129,15 @@ struct AnalysisResult: Codable {
     var plot: PlotData?
     var warnings: [String] = []
     var notes: [String]?
+    var flags: [String]?
+    var channelQuality: [ChannelQuality]?
+    var channelSource: String?    // "locked" (saved colour), "auto" (chosen now), "fallback" (none passed)
+    var channelPassed: Bool?
+    var colourSetup: Int?
+    var flashRaised: Bool?
     var text = ""
+
+    var isFlagged: Bool { !(flags ?? []).isEmpty }
 
     /// The ratio decisions use: out-of-chest axis, before the pulse (older results: whatever was saved).
     var bestLock: Double {
@@ -153,6 +175,10 @@ struct SessionData {
     var os = ""
     var lens = "main"
     var torchPct: Double?
+    var lockedChannel: String?
+    var colourSetup: Int?
+    var flags: [String] = []
+    var flashRaised: Bool?
     var ppg: [String: [Double]] = [:]
     var ppgRecord: [Bool] = []
     var acc: [String: [Double]] = [:]
@@ -257,6 +283,10 @@ enum Analyzer {
         d.os = meta["os_version"] as? String ?? ""
         d.lens = meta["lens"] as? String ?? "main"
         if let cam = meta["camera"] as? [String: Any], let tl = cam["torch_level"] as? Double { d.torchPct = 100 * tl }
+        d.lockedChannel = meta["ppg_channel_locked"] as? String
+        d.colourSetup = meta["colour_setup"] as? Int
+        d.flags = meta["flags"] as? [String] ?? []
+        d.flashRaised = meta["flash_raised"] as? Bool
         let p = try readCSV(folder.appendingPathComponent("ppg.csv"))
         d.ppg = p.cols
         let pn = p.cols["t"]?.count ?? 0
@@ -336,7 +366,8 @@ enum Analyzer {
         var rawL: [Double] = []
     }
 
-    static func ppgProcess(t: [Double], cols: [String: [Double]], fs: Double, t0: Double, t1: Double) -> PPG {
+    static func ppgProcess(t: [Double], cols: [String: [Double]], fs: Double, t0: Double, t1: Double,
+                           force: String? = nil) -> PPG {
         var P = PPG()
         P.fs = fs
         var best = "r", bestScore = -1.0
@@ -356,6 +387,7 @@ enum Analyzer {
                 bestScore = score
             }
         }
+        if let f = force, cols[f] != nil { best = f }
         P.channel = best
         let u = DSP.uniform(t, cols[best] ?? [], fs: fs, t0: t0, t1: t1)
         let L = u.x
@@ -376,6 +408,129 @@ enum Analyzer {
         P.rawT = u.t
         P.rawL = L
         return P
+    }
+
+    /// Quality of one colour at the camera's own rate. Returns the quality and the times of the clean pulses.
+    static func channelQuality(t: [Double], col: [Double], ch: String, fs: Double, t0: Double, t1: Double)
+        -> (ChannelQuality, [Double]) {
+        var q = ChannelQuality()
+        q.channel = ch
+        let L = DSP.uniform(t, col, fs: fs, t0: t0, t1: t1).x
+        q.mean = DSP.mean(L)
+        guard L.count > Int(10 * fs), q.mean.isFinite else { return (q, []) }
+        let ac = DSP.bandpass(L, fs: fs, lo: 0.7, hi: 3.5)
+        q.peakRatio = DSP.std(ac) > 0 ? DSP.spectralPeakRatio(ac, fs: fs, lo: 0.7, hi: 3.5) : 0
+        let v = DSP.bandpass(L, fs: fs, lo: 0.5, hi: 10).map { -$0 }
+        let hr = DSP.dominantHR(v, fs: fs)
+        guard hr.isFinite, hr > 0 else { return (q, []) }
+        let T = 1 / hr
+        let pk = DSP.findPeaks(v, distance: Int(0.6 * T * fs), wl: Int(1.5 * T * fs), minRelProm: 0.3)
+        var feet: [Int] = []
+        var peaks: [Int] = []
+        for i in pk {
+            let a = max(0, i - Int(0.5 * T * fs))
+            if i - a < 3 { continue }
+            let f = DSP.argmin(v, a, i)
+            if i - f < 2 { continue }
+            feet.append(f)
+            peaks.append(i)
+        }
+        q.beats = feet.count
+        guard feet.count >= 5 else { return (q, []) }
+        var amps: [Double] = []
+        for k in 0..<feet.count { amps.append(v[peaks[k]] - v[feet[k]]) }
+        var ibi: [Double] = []
+        for k in 0..<(feet.count - 1) { ibi.append(Double(feet[k + 1] - feet[k]) / fs) }
+        let medA = DSP.median(amps), medI = DSP.median(ibi)
+        var ok = [Bool](repeating: false, count: feet.count)
+        for k in 0..<feet.count {
+            let ib = k < ibi.count ? ibi[k] : Double.nan
+            ok[k] = amps[k] > 0.4 * medA && amps[k] < 2.5 * medA && (!ib.isFinite || abs(ib - medI) < 0.25 * medI)
+        }
+        q.okBeats = ok.filter { $0 }.count
+        q.ibiCvPct = medI > 0 ? 100 * DSP.robustSD(ibi) / medI : .nan
+        // beat shape: each clean beat (normalised) compared with the typical beat
+        let pre = Int(0.1 * T * fs), post = Int(0.6 * T * fs)
+        var segs: [[Double]] = []
+        for k in 0..<feet.count where ok[k] {
+            let f = feet[k]
+            if f - pre < 0 || f + post > v.count { continue }
+            let s = Array(v[(f - pre)..<(f + post)])
+            let m = DSP.mean(s), sd = DSP.std(s)
+            if sd > 0 { segs.append(s.map { ($0 - m) / sd }) }
+        }
+        if segs.count >= 5 {
+            let tm = DSP.columnMedian(segs)
+            let tmu = DSP.mean(tm), tsd = DSP.std(tm)
+            if tsd > 0 {
+                var cs: [Double] = []
+                for s in segs {
+                    var c = 0.0
+                    let n = min(s.count, tm.count)
+                    for j in 0..<n { c += s[j] * (tm[j] - tmu) / tsd }
+                    cs.append(c / Double(n))
+                }
+                q.shapeCorr = DSP.median(cs)
+            }
+        }
+        var times: [Double] = []
+        for k in 0..<feet.count where ok[k] { times.append(t0 + Double(feet[k]) / fs) }
+        return (q, times)
+    }
+
+    /// Pass/fail rules for a colour. Thresholds are judgement calls, checked on the first real recordings.
+    static func judge(_ q: inout ChannelQuality) {
+        var why: [String] = []
+        if !(q.mean >= 10) { why.append("too dark") }
+        if q.mean > 245 { why.append("too bright") }
+        if q.okBeats < 15 {
+            why.append("too few clean beats")
+        } else if Double(q.okBeats) < 0.6 * Double(q.beats) {
+            why.append("many irregular beats")
+        }
+        if !(q.peakRatio >= 5) { why.append("heartbeat rhythm not clear") }
+        if !(q.ibiCvPct <= 15) { why.append("beat timing irregular") }
+        if !(q.shapeCorr >= 0.8) { why.append("beat shape inconsistent") }
+        if let ag = q.agreementPct, ag < 70 { why.append("beats don't match the other colour") }
+        q.passed = why.isEmpty
+        q.reason = why.joined(separator: ", ")
+    }
+
+    /// Quality of every colour, including whether red and green find the same beats.
+    static func assessColours(t: [Double], cols: [String: [Double]], fs: Double, t0: Double, t1: Double) -> [ChannelQuality] {
+        var qs: [ChannelQuality] = []
+        var feet: [String: [Double]] = [:]
+        for c in ["r", "g", "b"] {
+            guard let col = cols[c] else { continue }
+            let res = channelQuality(t: t, col: col, ch: c, fs: fs, t0: t0, t1: t1)
+            var q = res.0
+            judge(&q)
+            qs.append(q)
+            feet[c] = res.1
+        }
+        for i in qs.indices where qs[i].channel == "r" || qs[i].channel == "g" {
+            let other = qs[i].channel == "r" ? "g" : "r"
+            guard let j = qs.firstIndex(where: { $0.channel == other }), qs[j].passed,
+                  let fo = feet[other], let fm = feet[qs[i].channel], !fm.isEmpty else { continue }
+            var hit = 0
+            for x in fm where fo.contains(where: { abs($0 - x) <= 0.05 }) { hit += 1 }
+            qs[i].agreementPct = 100 * Double(hit) / Double(fm.count)
+        }
+        for i in qs.indices { judge(&qs[i]) }
+        return qs
+    }
+
+    /// Best colour among those that passed: most consistent beat shape; if close (within 0.02),
+    /// the larger share of clean beats; if that is close too (within 2 points), the clearer rhythm.
+    static func bestColour(_ qs: [ChannelQuality]) -> String? {
+        func cleanShare(_ q: ChannelQuality) -> Double { q.beats > 0 ? Double(q.okBeats) / Double(q.beats) : 0 }
+        let passing = qs.filter { $0.passed }.sorted { a, b in
+            if abs(a.shapeCorr - b.shapeCorr) > 0.02 { return a.shapeCorr > b.shapeCorr }
+            let ca = cleanShare(a), cb = cleanShare(b)
+            if abs(ca - cb) > 0.02 { return ca > cb }
+            return a.peakRatio > b.peakRatio
+        }
+        return passing.first?.channel
     }
 
     static func ppgBeats(_ P: PPG) -> [Beat] {
@@ -781,7 +936,34 @@ enum Analyzer {
             if !R.exposureFixed { R.warnings.append("Camera exposure changed during the recording, so light levels are not comparable over time.") }
         }
 
-        let P = ppgProcess(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1)
+        // finger colour: the saved one if there is one; otherwise the best that passes every check
+        let quals = assessColours(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1)
+        R.channelQuality = quals
+        R.colourSetup = d.colourSetup
+        R.flashRaised = d.flashRaised
+        var flags = d.flags
+        var force: String?
+        if let lk = d.lockedChannel, pc[lk] != nil {
+            force = lk
+            R.channelSource = "locked"
+        } else if let b = bestColour(quals) {
+            force = b
+            R.channelSource = "auto"
+        } else {
+            R.channelSource = "fallback"
+        }
+        let P = ppgProcess(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1, force: force)
+        let usedQ = quals.first { $0.channel == P.channel }
+        R.channelPassed = usedQ?.passed ?? false
+        if d.mode != "tap" {
+            if R.channelSource == "locked", let q = usedQ, !q.passed {
+                flags.append("The saved finger colour (\(ColourProfile.name(q.channel))) failed the quality check: \(q.reason).")
+            } else if R.channelSource == "fallback" {
+                let why = usedQ?.reason ?? "no clean pulse"
+                flags.append("The finger pulse failed the quality check in every colour (\(ColourProfile.name(P.channel)): \(why)). Results are unreliable.")
+            }
+        }
+        R.flags = flags.isEmpty ? nil : flags
         R.channels = P.info
         R.channel = P.channel
         R.hrPpg = 60 * P.hrHz
@@ -1032,7 +1214,7 @@ enum Analyzer {
         var L: [String] = []
         L.append("Session: \(R.session)")
         L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.2)")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.3)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {
@@ -1048,6 +1230,21 @@ enum Analyzer {
             L.append("  \(c.channel): mean \(f1(c.mean))  pulsatility \(String(format: "%.2f", c.pulsatilityPct))%  peak ratio \(f1(c.peakRatio))" + (c.channel == R.channel ? "   <- used" : ""))
         }
         L.append("  PPG heart rate \(f1(R.hrPpg)) bpm")
+        if let qs = R.channelQuality {
+            let src: String
+            switch R.channelSource {
+            case "locked": src = "saved colour"
+            case "auto": src = "chosen now: passed every check, most consistent beats"
+            default: src = "none passed; best available used"
+            }
+            L.append("  Colour used: \(ColourProfile.name(R.channel)) (\(src))")
+            L.append("  Quality per colour (clean beats, rhythm clarity, timing variation, beat shape, match with other colour):")
+            for q in qs {
+                let ag = q.agreementPct.map { String(format: "%.0f%%", $0) } ?? "not checked"
+                let verdict = q.passed ? "pass" : "fail: \(q.reason)"
+                L.append("    \(q.channel): \(q.okBeats)/\(q.beats), clarity \(f1(q.peakRatio)), timing \(f1(q.ibiCvPct))%, shape \(String(format: "%.3f", q.shapeCorr)), match \(ag) -> \(verdict)")
+            }
+        }
         if let t = R.tap {
             L.append("")
             L.append("Tap sync test")
@@ -1092,6 +1289,10 @@ enum Analyzer {
                 L.append("Caution: choosing the 'best' row from many combinations overfits. Use pilot sessions")
                 L.append("to pick ONE combination, write it down, then judge it on new sessions only.")
             }
+        }
+        if let fl = R.flags, !fl.isEmpty {
+            L.append("")
+            for f in fl { L.append("FLAGGED: \(f)") }
         }
         if let ns = R.notes, !ns.isEmpty {
             L.append("")

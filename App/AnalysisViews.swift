@@ -144,6 +144,9 @@ struct VerdictRows: View {
                     ResultLine(label: "PIR (median, CV)", value: "\(fmt(r.pirMedian, "%.3f")), \(fmt(r.pirCv))%", ok: nil)
                 }
             }
+            ForEach(r.flags ?? [], id: \.self) { f in
+                Label(f, systemImage: "flag.fill").font(.caption).foregroundColor(.orange)
+            }
             ForEach(r.notes ?? [], id: \.self) { nt in
                 Text(nt).font(.caption).foregroundColor(.secondary)
             }
@@ -297,17 +300,34 @@ struct AnalysisSections: View {
                 ResultLine(label: "Analysed span", value: "\(fmt(r.spanS)) s", ok: nil)
                 if !r.device.isEmpty { ResultLine(label: "Device", value: r.device, ok: nil) }
                 if let l = r.lens { ResultLine(label: "Camera lens", value: l, ok: nil) }
-                if let tp = r.torchPct { ResultLine(label: "Flash level", value: String(format: "%.0f%%", tp), ok: nil) }
+                if let tp = r.torchPct {
+                    ResultLine(label: "Flash level", value: String(format: "%.0f%%", tp) + ((r.flashRaised ?? false) ? " (raised while positioning)" : ""), ok: nil)
+                }
                 if let dr = r.lightDriftPct {
                     ResultLine(label: "Finger light drift", value: String(format: "%+.1f%%", dr), ok: r.mode == "tap" ? nil : abs(dr) <= 5)
                 }
             }
-            Section("Finger pulse colour channels") {
-                ForEach(r.channels, id: \.channel) { c in
-                    ResultLine(label: c.channel.uppercased() + (c.channel == r.channel ? " (used)" : ""),
-                               value: "mean \(fmt(c.mean, "%.0f")), pulse \(fmt(c.pulsatilityPct, "%.2f"))%, clarity \(fmt(c.peakRatio))",
-                               ok: nil)
+            Section("Finger pulse colour") {
+                ResultLine(label: "Colour used", value: colourUsedText, ok: r.channelPassed)
+                ForEach(r.channelQuality ?? [], id: \.channel) { q in
+                    VStack(alignment: .leading, spacing: 2) {
+                        ResultLine(label: q.channel.uppercased() + (q.channel == r.channel ? " (used)" : ""),
+                                   value: q.passed ? "clean pulse" : "failed", ok: q.passed)
+                        Text(qualityText(q)).font(.caption2).foregroundColor(.secondary)
+                        if !q.passed && !q.reason.isEmpty {
+                            Text(q.reason).font(.caption2).foregroundColor(.orange)
+                        }
+                    }
                 }
+                if r.channelQuality == nil {
+                    ForEach(r.channels, id: \.channel) { c in
+                        ResultLine(label: c.channel.uppercased() + (c.channel == r.channel ? " (used)" : ""),
+                                   value: "mean \(fmt(c.mean, "%.0f")), pulse \(fmt(c.pulsatilityPct, "%.2f"))%, clarity \(fmt(c.peakRatio))",
+                                   ok: nil)
+                    }
+                }
+                Text("A real heartbeat: enough clean beats, one steady rhythm, steady beat timing, beats that look alike, and the same beats seen in red and green. Noise fails these.")
+                    .font(.caption2).foregroundColor(.secondary)
             }
             if !r.locks.isEmpty {
                 Section("Heartbeat check per chest band") {
@@ -342,6 +362,21 @@ struct AnalysisSections: View {
 }
 
 extension AnalysisSections {
+    var colourUsedText: String {
+        let n = ColourProfile.name(r.channel)
+        switch r.channelSource {
+        case "locked": return "\(n) (saved)"
+        case "auto": return "\(n) (chosen automatically)"
+        case "fallback": return "\(n) (none passed)"
+        default: return n
+        }
+    }
+
+    func qualityText(_ q: ChannelQuality) -> String {
+        let ag = q.agreementPct.map { String(format: "%.0f%%", $0) } ?? "not checked"
+        return "brightness \(fmt(q.mean, "%.0f")), clean beats \(q.okBeats)/\(q.beats), rhythm \(fmt(q.peakRatio)), timing \(fmt(q.ibiCvPct))%, shape \(fmt(q.shapeCorr, "%.2f")), match \(ag)"
+    }
+
     func lockLabel(_ l: BandLock) -> String { "\(l.band) · \(Analyzer.axisName(l.axis))" }
 
     func lockValue(_ l: BandLock) -> String {
@@ -428,7 +463,7 @@ struct CompareRow: View {
     var detail: String {
         guard let r = item.result else { return "not analysed yet" }
         if let t = r.tap { return "tap: offset \(fmt(t.offsetMedianMs)) ms, SD \(fmt(t.offsetSdMs)) ms, \(t.paired) taps" }
-        var s = "\(r.mode) · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 2 ? " (old analysis)" : "")
+        var s = (r.isFlagged ? "⚑ flagged · " : "") + "\(r.mode) · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 2 ? " (old analysis)" : "")
         if r.mode == "chest", let f = r.fixed {
             s += " · PTT \(fmt(f.pttMedianMs, "%.0f")) ± \(fmt(f.pttRobustSdMs, "%.0f")) ms"
         }
@@ -444,7 +479,12 @@ struct CompareView: View {
     @State private var progress = ""
 
     var results: [AnalysisResult] { items.compactMap { $0.result } }
-    var chest: [AnalysisResult] { results.filter { $0.mode == "chest" } }
+    var currentSetup: Int { ColourProfile.setup }
+    var chestAll: [AnalysisResult] { results.filter { $0.mode == "chest" } }
+    /// Chest recordings that count: not flagged, and from the current finger-colour choice.
+    var chest: [AnalysisResult] {
+        chestAll.filter { !$0.isFlagged && (currentSetup == 0 || $0.colourSetup == currentSetup) }
+    }
     var detected: [AnalysisResult] { chest.filter { $0.scgDetected == true } }
     var pttMedians: [Double] { detected.compactMap { $0.fixed?.pttMedianMs }.filter { $0.isFinite } }
     var pttWithin: [Double] { detected.compactMap { $0.fixed?.pttRobustSdMs }.filter { $0.isFinite } }
@@ -461,6 +501,10 @@ struct CompareView: View {
             }
             Section("Chest + finger at rest") {
                 ResultLine(label: "Heartbeat detected", value: "\(detected.count) of \(chest.count) recordings", ok: nil)
+                if chestAll.count > chest.count {
+                    Text("\(chestAll.count - chest.count) chest recording(s) not counted: flagged, or from an earlier finger-colour choice.")
+                        .font(.caption).foregroundColor(.orange)
+                }
                 ResultLine(label: "PTT, mean of recordings", value: "\(fmt(DSP.mean(pttMedians), "%.0f")) ms", ok: nil)
                 ResultLine(label: "PTT spread between recordings (SD)", value: "\(fmt(DSP.sampleSD(pttMedians))) ms", ok: nil)
                 ResultLine(label: "Typical spread within a recording", value: "\(fmt(DSP.median(pttWithin))) ms", ok: nil)

@@ -55,8 +55,16 @@ final class Recorder: ObservableObject {
     @Published var fps = 120
     @Published var duration = 60
     @Published var accHz = 400
-    @Published var lens: CameraLens = .main
-    @Published var torchPct = 80
+    /// Remembered between app launches, so every recording on this phone uses the same lens.
+    @Published var lens: CameraLens = CameraLens.remembered() {
+        didSet { UserDefaults.standard.set(lens.rawValue, forKey: "hc.lens") }
+    }
+    /// Flash starts at 80% every recording and is raised (90%, then 100%) only while positioning, and only if
+    /// the finger is too dim with the camera already at its most sensitive. It never changes during the recording.
+    let torchStartPct = 80
+    @Published var torchNowPct = 80
+    @Published var colourChannel: String? = ColourProfile.channel
+    @Published var colourMessage = ""
     @Published var settle = 10
     @Published var live = LiveStats()
     @Published var errorMessage: String?
@@ -84,6 +92,9 @@ final class Recorder: ObservableObject {
     private var lastSlow = 0.0
     private var slow = LiveBeat()
     private var liveChannel = "g"
+    private var lastTorchStep = 0.0
+    private var flags: [String] = []
+    private var lightAtStart = 0.0
 
     func start() async {
         errorMessage = nil
@@ -93,13 +104,15 @@ final class Recorder: ObservableObject {
         }
         guard motion.accelerometerAvailable else { errorMessage = "Accelerometer not available."; return }
         do {
-            cameraInfo = try camera.configure(targetFPS: Double(fps), lens: lens, torchLevel: Double(torchPct) / 100)
+            torchNowPct = torchStartPct
+            cameraInfo = try camera.configure(targetFPS: Double(fps), lens: lens, torchLevel: Double(torchStartPct) / 100)
         } catch {
             errorMessage = error.localizedDescription
             return
         }
         markers = []
-        lastSlow = 0; slow = LiveBeat(); liveChannel = "g"
+        lastSlow = 0; slow = LiveBeat(); liveChannel = ColourProfile.channel ?? "g"
+        lastTorchStep = 0; flags = []; lightAtStart = 0; colourMessage = ""
         analysis = nil; analysisError = nil; analyzing = false
         cuffSBP = ""; cuffDBP = ""; notes = ""; savedNote = ""
         UIApplication.shared.isIdleTimerDisabled = true
@@ -126,7 +139,17 @@ final class Recorder: ObservableObject {
         case .preparing:
             let left = settleSeconds - (now - tStart)
             remaining = max(0, Int(left.rounded(.up)))
+            // raise the flash one step if the finger is dim and the camera can't brighten any more by itself
+            if left > 1.5 && now - tStart > 3 && now - lastTorchStep > 2 && torchNowPct < 100 {
+                let light = recentLight(1.0)
+                if light > 0 && light < 150 && camera.atSensitivityLimit {
+                    torchNowPct = min(100, torchNowPct + 10)
+                    camera.setTorch(level: Double(torchNowPct) / 100)
+                    lastTorchStep = now
+                }
+            }
             if left <= 0 {
+                checkLightAtStart()
                 camera.freezeExposure()
                 tRecord = HostClock.now
                 phase = .recording
@@ -141,6 +164,27 @@ final class Recorder: ObservableObject {
             break
         }
         updateLive()
+    }
+
+    /// Mean of the brightest colour over the last `seconds` (0 if no frames yet).
+    private func recentLight(_ seconds: Double) -> Double {
+        let rp = camera.recent(seconds: seconds)
+        guard rp.count > 10 else { return 0 }
+        var s = 0.0
+        for p in rp { s += Double(max(p.r, max(p.g, p.b))) }
+        return s / Double(rp.count)
+    }
+
+    /// Flag the recording if the finger light is still too low when recording starts.
+    private func checkLightAtStart() {
+        let light = recentLight(1.0)
+        lightAtStart = light
+        cameraInfo["torch_level"] = Double(torchNowPct) / 100
+        if light < 60 {
+            flags.append(String(format: "Finger light too dark when recording started (%.0f of 255). The finger may not cover the camera and the flash.", light))
+        } else if light < 100 && camera.atSensitivityLimit {
+            flags.append(String(format: "Finger light below target when recording started (%.0f of 255) with the flash at %d%%.", light, torchNowPct))
+        }
     }
 
     private func updateLive() {
@@ -159,7 +203,8 @@ final class Recorder: ObservableObject {
         let now = HostClock.now
         if now - lastSlow >= 1.0 {
             lastSlow = now
-            slow = LiveDSP.beatSummary(ppg: camera.recent(seconds: 20), acc: motion.recentAcc(seconds: 20))
+            slow = LiveDSP.beatSummary(ppg: camera.recent(seconds: 20), acc: motion.recentAcc(seconds: 20),
+                                       channel: ColourProfile.channel)
             liveChannel = slow.channel
         }
         s.beat = slow
@@ -195,7 +240,7 @@ final class Recorder: ObservableObject {
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
         meta = [
-            "app": "HC Capture 0.3.2",
+            "app": "HC Capture 0.3.3",
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
@@ -213,6 +258,12 @@ final class Recorder: ObservableObject {
             "units": ["acc": "g", "gyro": "rad/s", "ppg": "mean 0-255 per channel"],
             "orientation_protocol": mode == .table ? "screen down on table" : "screen against chest, -z = out of chest",
             "cuff_sbp": NSNull(), "cuff_dbp": NSNull(), "notes": "",
+            "torch_level_start": Double(torchStartPct) / 100,
+            "flash_raised": torchNowPct > torchStartPct,
+            "light_at_start": lightAtStart,
+            "flags": flags,
+            "ppg_channel_locked": ColourProfile.channel.map { $0 as Any } ?? NSNull(),
+            "colour_setup": ColourProfile.setup,
         ]
         let rows = SessionStore.summarize(ppg: ppg, acc: acc, dropped: dropped, targetFPS: Double(fps),
                                           tRecord: tRecord, tEnd: tEnd)
@@ -241,7 +292,8 @@ final class Recorder: ObservableObject {
         Task {
             let r = await Analyzer.analyzeAsync(folder: folder)
             switch r {
-            case .success(let a):
+            case .success(let a0):
+                let a = self.updateColourProfile(a0, folder: folder)
                 self.analysis = a
                 self.speak(self.spokenSummary(a))
             case .failure(let e):
@@ -286,8 +338,61 @@ final class Recorder: ObservableObject {
         recordings = SessionStore.list()
     }
 
+    /// Keep the finger colour fixed between recordings, choosing it automatically when needed.
+    private func updateColourProfile(_ a: AnalysisResult, folder: URL) -> AnalysisResult {
+        guard a.mode == "chest" || a.mode == "table" else { return a }
+        var out = a
+        if ColourProfile.channel != nil && a.channelSource == "locked" {
+            if a.channelPassed == true {
+                ColourProfile.fails = 0
+            } else {
+                ColourProfile.fails += 1
+                if ColourProfile.fails >= 3 {
+                    ColourProfile.channel = nil
+                    ColourProfile.fails = 0
+                    colourMessage = "The saved finger colour failed 3 recordings in a row. It will be chosen again automatically on the next recording."
+                }
+            }
+        } else if ColourProfile.channel == nil && a.channelSource == "auto" && a.channelPassed == true {
+            ColourProfile.setup += 1
+            ColourProfile.channel = a.channel
+            ColourProfile.fails = 0
+            ColourProfile.chosenOn = ISO8601DateFormatter().string(from: Date())
+            colourMessage = "Finger colour set to \(ColourProfile.name(a.channel)). It will be used for every recording from now on."
+            var m = SessionStore.readMeta(folder: folder)
+            m["ppg_channel_locked"] = a.channel
+            m["colour_setup"] = ColourProfile.setup
+            m["colour_chosen_here"] = true
+            try? SessionStore.writeMeta(folder: folder, meta: m)
+            out.colourSetup = ColourProfile.setup
+            try? Analyzer.save(out, folder)
+        }
+        colourChannel = ColourProfile.channel
+        return out
+    }
+
+    /// Start choosing the finger colour afresh (for example for a different person on this phone).
+    func resetColour() {
+        ColourProfile.channel = nil
+        ColourProfile.fails = 0
+        colourChannel = nil
+        colourMessage = "The finger colour will be chosen again automatically on the next chest or table recording."
+    }
+
     /// Short spoken result, because the screen faces the chest. Spoken only after recording ends.
     func spokenSummary(_ r: AnalysisResult) -> String {
+        let core = spokenCore(r)
+        var pre = ""
+        if r.isFlagged { pre = "Recording flagged. " }
+        var post = ""
+        if r.channelSource == "auto" && r.colourSetup != nil && r.colourSetup == ColourProfile.setup
+            && ColourProfile.channel == r.channel && (r.mode == "chest" || r.mode == "table") && !colourMessage.isEmpty {
+            post = " Finger colour set to \(ColourProfile.name(r.channel))."
+        }
+        return pre + core + post
+    }
+
+    private func spokenCore(_ r: AnalysisResult) -> String {
         var red = Double.nan
         for c in r.channels where c.channel == "r" { red = c.mean }
         if red.isFinite && red < 60 {
