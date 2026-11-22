@@ -21,11 +21,34 @@ struct FormatPick {
     let height: Int
 }
 
+/// Which rear lens records the fingertip. The flash sits in a different spot from each lens,
+/// so the best lens is the one a fingertip can cover together with the flash.
+enum Lens: String, CaseIterable, Identifiable {
+    case main, ultraWide, telephoto
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .main: return "Main (1x)"
+        case .ultraWide: return "Ultra-wide (0.5x)"
+        case .telephoto: return "Telephoto"
+        }
+    }
+    var deviceType: AVCaptureDevice.DeviceType {
+        switch self {
+        case .main: return .builtInWideAngleCamera
+        case .ultraWide: return .builtInUltraWideCamera
+        case .telephoto: return .builtInTelephotoCamera
+        }
+    }
+}
+
 enum CaptureError: LocalizedError {
     case noCamera, cannotAddInput, cannotAddOutput, noFormat
+    case noLens(String)
     var errorDescription: String? {
         switch self {
-        case .noCamera: return "No rear camera found."
+        case .noLens(let n): return "This phone has no \(n) camera."
+        case .noCamera: return "No rear camera found.\"
         case .cannotAddInput: return "Could not open the camera."
         case .cannotAddOutput: return "Could not read camera frames."
         case .noFormat: return "No suitable camera format."
@@ -40,6 +63,7 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let videoQueue = DispatchQueue(label: "hc.camera.video", qos: .userInteractive)
     private let output = AVCaptureVideoDataOutput()
     private var device: AVCaptureDevice?
+    private var torchDevice: AVCaptureDevice?
     private var configured = false
     private var customExposure = false
     private var maxDur: Double = 1.0 / 60.0
@@ -54,14 +78,24 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     // MARK: configuration
 
-    func configure(targetFPS: Double) throws -> [String: Any] {
-        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-            throw CaptureError.noCamera
+    func configure(targetFPS: Double, lens: Lens) throws -> [String: Any] {
+        guard let dev = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) else {
+            throw CaptureError.noLens(lens.title)
         }
+        let currentID = session.inputs.compactMap { ($0 as? AVCaptureDeviceInput)?.device.uniqueID }.first
+        let switching = configured && currentID != dev.uniqueID
         device = dev
+        // if this lens has no torch of its own, light the finger with the main camera's torch
+        torchDevice = dev.hasTorch ? dev : AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
+        if switching {
+            for i in session.inputs { session.removeInput(i) }
+            let input = try AVCaptureDeviceInput(device: dev)
+            guard session.canAddInput(input) else { throw CaptureError.cannotAddInput }
+            session.addInput(input)
+        }
         if !configured {
             let input = try AVCaptureDeviceInput(device: dev)
             guard session.canAddInput(input) else { throw CaptureError.cannotAddInput }
@@ -126,6 +160,9 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             "stabilization": "off", "pixel_format": "BGRA",
             "roi": "central 60% of frame, every 8th pixel in x and y",
             "torch": dev.hasTorch,
+            "lens": lens.rawValue,
+            "lens_name": dev.localizedName,
+            "torch_device": torchDevice?.localizedName ?? "none",
         ]
     }
 
@@ -171,8 +208,13 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let dev = device else { return }
         do { try dev.lockForConfiguration() } catch { return }
         defer { dev.unlockForConfiguration() }
-        if dev.hasTorch && dev.isTorchModeSupported(.on) {
-            do { try dev.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) } catch { dev.torchMode = .on }
+        if let td = torchDevice, td.hasTorch, td.isTorchModeSupported(.on) {
+            if td.uniqueID == dev.uniqueID {
+                do { try dev.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) } catch { dev.torchMode = .on }
+            } else if (try? td.lockForConfiguration()) != nil {
+                do { try td.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) } catch { td.torchMode = .on }
+                td.unlockForConfiguration()
+            }
         }
         let f = dev.activeFormat
         if customExposure {
@@ -196,9 +238,9 @@ final class CameraPPG: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     func stop() async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             sessionQueue.async {
-                if let dev = self.device, dev.hasTorch, (try? dev.lockForConfiguration()) != nil {
-                    dev.torchMode = .off
-                    dev.unlockForConfiguration()
+                if let td = self.torchDevice, td.hasTorch, (try? td.lockForConfiguration()) != nil {
+                    td.torchMode = .off
+                    td.unlockForConfiguration()
                 }
                 self.session.stopRunning()
                 c.resume()

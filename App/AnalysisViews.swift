@@ -240,6 +240,33 @@ struct ChartSections: View {
     }
 }
 
+// MARK: - tap sync charts
+
+struct TapChartSection: View {
+    let p: PlotData
+
+    var body: some View {
+        Section("Tap signals, whole recording") {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Camera light change (orange = events found: \(p.featureTimes.count))").font(.caption)
+                TracePlot(values: p.light, start: p.lightStart, dx: p.lightDt, xMin: p.x0, xMax: p.x1,
+                          color: .red, lines: p.featureTimes.map { VLine(x: $0, color: .orange) }, height: 90)
+                Text("Accelerometer above 5 Hz (green = taps found: \(p.aoTimes.count))").font(.caption)
+                TracePlot(values: p.scg, start: p.start, dx: p.dt, xMin: p.x0, xMax: p.x1,
+                          color: .primary, lines: p.aoTimes.map { VLine(x: $0, color: .green) }, height: 90)
+                HStack {
+                    Text("0 s")
+                    Spacer()
+                    Text("\(fmt(p.x1, "%.0f")) s")
+                }
+                .font(.caption2).foregroundColor(.secondary)
+                Text("Each tap should show as a sharp spike in both traces at about the same moment. Spikes in only one trace, or many small ones, point to weak taps or a dark finger signal.")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
 // MARK: - full analysis
 
 struct AnalysisSections: View {
@@ -248,7 +275,9 @@ struct AnalysisSections: View {
     var body: some View {
         Group {
             Section("Result") { VerdictRows(r: r) }
-            if let p = r.plot { ChartSections(p: p) }
+            if let p = r.plot {
+                if p.isTap == true { TapChartSection(p: p) } else { ChartSections(p: p) }
+            }
             Section("Capture quality") {
                 ForEach(r.rates, id: \.name) { s in
                     ResultLine(label: s.name.capitalized,
@@ -257,6 +286,7 @@ struct AnalysisSections: View {
                 ResultLine(label: "Exposure held fixed", value: r.exposureFixed ? "yes" : "no", ok: r.exposureFixed)
                 ResultLine(label: "Analysed span", value: "\(fmt(r.spanS)) s", ok: nil)
                 if !r.device.isEmpty { ResultLine(label: "Device", value: r.device, ok: nil) }
+                if let l = r.lens { ResultLine(label: "Camera lens", value: l, ok: nil) }
             }
             Section("Finger pulse colour channels") {
                 ForEach(r.channels, id: \.channel) { c in

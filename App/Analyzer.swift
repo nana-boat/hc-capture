@@ -56,6 +56,7 @@ struct SeriesPoint: Codable {
 }
 
 struct PlotData: Codable {
+    var isTap: Bool?
     var label = ""
     var featureName = ""
     var x0 = 0.0                 // s, window start (relative to analysed start)
@@ -83,6 +84,7 @@ struct PlotData: Codable {
 
 struct AnalysisResult: Codable {
     var version = 1
+    var lens: String?
     var session = ""
     var mode = ""
     var device = ""
@@ -133,6 +135,7 @@ struct SessionData {
     var mode = ""
     var device = ""
     var os = ""
+    var lens = "main"
     var ppg: [String: [Double]] = [:]
     var ppgRecord: [Bool] = []
     var acc: [String: [Double]] = [:]
@@ -231,6 +234,7 @@ enum Analyzer {
         d.mode = meta["mode"] as? String ?? (d.name.components(separatedBy: "_").last ?? "")
         d.device = meta["device_model"] as? String ?? ""
         d.os = meta["os_version"] as? String ?? ""
+        d.lens = meta["lens"] as? String ?? "main"
         let p = try readCSV(folder.appendingPathComponent("ppg.csv"))
         d.ppg = p.cols
         let pn = p.cols["t"]?.count ?? 0
@@ -617,7 +621,7 @@ enum Analyzer {
         return ev
     }
 
-    static func tapSync(at: [Double], ac: [String: [Double]], fsA: Double, P: PPG, t0: Double, t1: Double) -> TapResult {
+    static func tapSync(at: [Double], ac: [String: [Double]], fsA: Double, P: PPG, t0: Double, t1: Double) -> (TapResult, PlotData) {
         let xs = ["x", "y", "z"].map { DSP.uniform(at, ac[$0] ?? [], fs: fsA, t0: t0, t1: t1).x }
         let n = xs.map { $0.count }.min() ?? 0
         var mag = [Double](repeating: 0, count: n)
@@ -646,7 +650,21 @@ enum Analyzer {
         r.paired = off.count
         r.offsetMedianMs = off.isEmpty ? .nan : 1000 * DSP.median(off)
         r.offsetSdMs = off.count > 1 ? 1000 * DSP.std(off) : .nan
-        return r
+        var pd = PlotData()
+        pd.isTap = true
+        pd.label = "Tap sync"
+        pd.x0 = 0
+        pd.x1 = t1 - t0
+        pd.light = dL
+        pd.lightStart = (P.rawT.first ?? t0) - t0
+        pd.lightDt = P.fs > 0 ? 1 / P.fs : 0.01
+        pd.scg = hp
+        pd.start = 0
+        pd.dt = 1 / fsA
+        pd.featureTimes = ep.map { $0 - t0 }
+        pd.aoTimes = ea.map { $0 - t0 }
+        pd.aoValid = ea.map { _ in true }
+        return (r, pd)
     }
 
     // MARK: one session
@@ -656,6 +674,7 @@ enum Analyzer {
         var R = AnalysisResult()
         R.session = d.name
         R.mode = d.mode
+        R.lens = d.lens
         R.device = d.device.isEmpty ? "" : "\(d.device), iOS \(d.os)"
         R.created = ISO8601DateFormatter().string(from: Date())
         let ptAll = d.ppg["t"] ?? [], atAll = d.acc["t"] ?? []
@@ -687,9 +706,15 @@ enum Analyzer {
         R.channels = P.info
         R.channel = P.channel
         R.hrPpg = 60 * P.hrHz
+        let brightest = P.info.map { $0.mean }.max() ?? 0
+        if brightest < 60 {
+            R.warnings.append(String(format: "Finger signal very dark (brightest colour %.0f of 255; aim for 150 to 235). The flash light is not reaching the camera: cover the lens and the flash with one fingertip, or choose a lens closer to the flash.", brightest))
+        }
 
         if d.mode == "tap" {
-            R.tap = tapSync(at: at, ac: ac, fsA: fsA, P: P, t0: t0, t1: t1)
+            let ts = tapSync(at: at, ac: ac, fsA: fsA, P: P, t0: t0, t1: t1)
+            R.tap = ts.0
+            R.plot = ts.1
             if let tp = R.tap, tp.paired < 4 {
                 R.warnings.append("Fewer than 4 taps were found in both the camera and the accelerometer. Tap firmly, about every 4 seconds.")
             }
@@ -897,8 +922,8 @@ enum Analyzer {
     static func report(_ R: AnalysisResult) -> String {
         var L: [String] = []
         L.append("Session: \(R.session)")
-        L.append("Mode: \(R.mode)   Device: \(R.device)")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.2.0)")
+        L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.0)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {

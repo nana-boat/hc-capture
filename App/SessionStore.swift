@@ -150,7 +150,7 @@ enum SessionStore {
         let mg = rec.map { Double($0.g) }.reduce(0, +) / n
         let mb = rec.map { Double($0.b) }.reduce(0, +) / n
         rows.append(SummaryRow(label: "Colour levels R/G/B", value: String(format: "%.0f / %.0f / %.0f", mr, mg, mb),
-                               ok: mr < 245 && mg > 5))
+                               ok: mr >= 60 && mr < 245))
         let sat = 100 * rec.map { Double($0.satAny) }.reduce(0, +) / n
         rows.append(SummaryRow(label: "Saturated pixels", value: String(format: "%.1f%%", sat), ok: sat < 2))
         let pg = pulsatility(rec.map { Double($0.g) }, fs: fps)

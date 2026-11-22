@@ -43,6 +43,16 @@ struct SetupView: View {
                 .pickerStyle(.segmented)
                 Text(rec.mode.instructions).font(.callout)
             }
+            Section("Camera") {
+                Picker("Lens", selection: $rec.lens) {
+                    ForEach(Lens.allCases) { Text($0.title).tag($0) }
+                }
+                Text("Use the lens your fingertip can cover together with the flash. After Start, check the finger light bar before placing the phone.")
+                    .font(.caption).foregroundColor(.secondary)
+                Picker("Positioning time", selection: $rec.settle) {
+                    ForEach([7, 10, 15], id: \.self) { Text("\($0) s").tag($0) }
+                }
+            }
             Section("Settings") {
                 Picker("Camera frame rate", selection: $rec.fps) {
                     ForEach([60, 120, 240], id: \.self) { Text("\($0) fps").tag($0) }
@@ -92,7 +102,7 @@ struct RunView: View {
 
     var title: String {
         switch rec.phase {
-        case .preparing: return "Get in position. Camera is adjusting."
+        case .preparing: return "Place your finger and check the light bar. Camera is adjusting."
         case .recording: return "Recording. Stay still."
         default: return "Saving…"
         }
@@ -114,18 +124,20 @@ struct RunView: View {
 
     var lockColor: Color {
         let x = rec.live.beat.lock
-        guard x.isFinite else { return .secondary }
-        if rec.mode == .table { return x > 3 ? .orange : .green }
-        return x > 6 ? .green : (x > 3 ? .orange : .red)
+        guard x.isFinite else { return Color.secondary }
+        if rec.mode == .table { return x > 3 ? Color.orange : Color.green }
+        return x > 6 ? Color.green : (x > 3 ? Color.orange : Color.red)
     }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
-                Text(title).font(.headline).multilineTextAlignment(.center)
+                Text(title).font(.headline).multilineTextAlignment(.center).padding(.horizontal)
                 Text("\(rec.remaining)")
-                    .font(.system(size: 60, weight: .bold, design: .rounded))
+                    .font(.system(size: 56, weight: .bold, design: .rounded))
                     .monospacedDigit()
+                FingerLightView(r: Double(rec.live.r), sat: Double(rec.live.sat))
+                    .padding(.horizontal)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Finger pulse (\(rec.live.beat.channel.uppercased()), filtered)").font(.caption)
@@ -144,19 +156,96 @@ struct RunView: View {
                 }
                 .padding(.horizontal)
                 VStack(alignment: .leading, spacing: 4) {
+                    Text("Lens: \(rec.lens.title)")
                     Text(String(format: "Camera %.0f fps   Accelerometer %.0f Hz", rec.live.fps, rec.live.accHz))
                     Text(String(format: "R %.0f  G %.0f  B %.0f   saturated %.1f%%", rec.live.r, rec.live.g, rec.live.b, rec.live.sat))
                     Text(String(format: "ISO %.0f   exposure %.2f ms", rec.live.iso, rec.live.expMs))
                 }
                 .font(.system(.footnote, design: .monospaced))
-                HStack(spacing: 20) {
-                    Button("Mark") { rec.mark() }.buttonStyle(.bordered)
-                    Button("Stop", role: .destructive) { rec.stopEarly() }.buttonStyle(.borderedProminent)
+                HStack(spacing: 16) {
+                    HoldButton(title: "Hold to Mark", color: .blue) { t in rec.mark(at: t) }
+                    HoldButton(title: "Hold to Stop", color: .red) { _ in rec.stopEarly() }
                 }
                 .disabled(rec.phase == .saving)
+                Text("Buttons need a 1.5 s hold. The screen switches off while it touches your chest and wakes when you lift the phone. You'll hear the result when it ends.")
+                    .font(.caption2).foregroundColor(.secondary).multilineTextAlignment(.center).padding(.horizontal)
             }
             .padding(.vertical)
         }
+        .persistentSystemOverlays(.hidden)
+        .defersSystemGestures(on: .all)
+    }
+}
+
+/// Red level of the fingertip image, with the target zone the exposure controller aims for (150-235).
+struct FingerLightView: View {
+    let r: Double
+    let sat: Double      // percent of pixels saturated
+
+    var status: (String, Color) {
+        if r <= 0 { return ("Waiting for camera…", Color.secondary) }
+        if r < 60 {
+            return ("Too dark: the flash light isn't reaching the camera. Cover the lens and the flash with one fingertip, or pick another lens.", Color.red)
+        }
+        if sat > 2 || r > 245 { return ("Too bright: press a little lighter or shift your finger.", Color.orange) }
+        if r < 150 { return ("Dim: usable if the pulse line is smooth.", Color.orange) }
+        return ("Good finger light.", Color.green)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Finger light (red level, green zone = target)").font(.caption)
+                Spacer()
+                Text(String(format: "%.0f / 255", r)).font(.caption.bold())
+            }
+            LevelBar(value: r)
+            Text(status.0).font(.caption).foregroundColor(status.1)
+        }
+    }
+}
+
+struct LevelBar: View {
+    let value: Double
+
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 4).fill(Color.gray.opacity(0.25))
+                Rectangle().fill(Color.green.opacity(0.35))
+                    .frame(width: g.size.width * 85 / 255)
+                    .offset(x: g.size.width * 150 / 255)
+                RoundedRectangle(cornerRadius: 4).fill(Color.red)
+                    .frame(width: max(2, g.size.width * CGFloat(min(max(value, 0), 255) / 255)))
+            }
+        }
+        .frame(height: 14)
+    }
+}
+
+/// Button that only fires after a 1.5 s hold, so skin contact can't trigger it.
+/// The action receives the time the press started. No haptic: vibration would shake the accelerometer.
+struct HoldButton: View {
+    let title: String
+    let color: Color
+    let action: (Double) -> Void
+    @State private var pressing = false
+    @State private var pressStart = 0.0
+
+    var body: some View {
+        Text(title)
+            .font(.headline)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(color.opacity(pressing ? 0.55 : 0.2))
+            .foregroundColor(color)
+            .clipShape(Capsule())
+            .onLongPressGesture(minimumDuration: 1.5, maximumDistance: 40, perform: {
+                action(pressStart)
+            }, onPressingChanged: { p in
+                pressing = p
+                if p { pressStart = HostClock.now }
+            })
     }
 }
 

@@ -54,6 +54,8 @@ final class Recorder: ObservableObject {
     @Published var fps = 120
     @Published var duration = 60
     @Published var accHz = 400
+    @Published var lens: Lens = .main
+    @Published var settle = 10
     @Published var live = LiveStats()
     @Published var errorMessage: String?
     @Published var summary: [SummaryRow] = []
@@ -67,7 +69,7 @@ final class Recorder: ObservableObject {
     @Published var analyzing = false
     @Published var analysisError: String?
 
-    let settleSeconds = 7.0
+    var settleSeconds: Double { Double(settle) }
     private let camera = CameraPPG()
     private let motion = MotionSCG()
     private let speech = AVSpeechSynthesizer()
@@ -89,7 +91,7 @@ final class Recorder: ObservableObject {
         }
         guard motion.accelerometerAvailable else { errorMessage = "Accelerometer not available."; return }
         do {
-            cameraInfo = try camera.configure(targetFPS: Double(fps))
+            cameraInfo = try camera.configure(targetFPS: Double(fps), lens: lens)
         } catch {
             errorMessage = error.localizedDescription
             return
@@ -99,9 +101,12 @@ final class Recorder: ObservableObject {
         analysis = nil; analysisError = nil; analyzing = false
         cuffSBP = ""; cuffDBP = ""; notes = ""; savedNote = ""
         UIApplication.shared.isIdleTimerDisabled = true
+        // screen goes dark and ignores touches while it is against the chest (or face-down on the table)
+        UIDevice.current.isProximityMonitoringEnabled = true
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         try? AVAudioSession.sharedInstance().setActive(true)
-        speak(mode == .table ? "Place your finger on the camera." : "Place the phone now. Recording starts shortly.")
+        speak(mode == .table ? "Place your finger on the camera, check the light bar, then lay the phone screen down."
+              : "Place your finger, check the light bar, then put the phone on your chest.")
 
         phase = .preparing
         remaining = Int(settleSeconds)
@@ -161,6 +166,9 @@ final class Recorder: ObservableObject {
 
     func mark() { markers.append((HostClock.now, "mark")) }
 
+    /// t = moment the press started (the button needs a hold, so the mark is back-dated to the press).
+    func mark(at t: Double) { markers.append((t, "mark")) }
+
     func stopEarly() {
         guard phase == .preparing || phase == .recording else { return }
         if phase == .preparing { tRecord = HostClock.now }
@@ -175,6 +183,7 @@ final class Recorder: ObservableObject {
         motion.stop()
         await camera.stop()
         UIApplication.shared.isIdleTimerDisabled = false
+        UIDevice.current.isProximityMonitoringEnabled = false
 
         let (ppg, dropped) = camera.takeAll()
         let (acc, gyro) = motion.takeAll()
@@ -184,7 +193,8 @@ final class Recorder: ObservableObject {
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
         meta = [
-            "app": "HC Capture 0.2.0",
+            "app": "HC Capture 0.3.0",
+            "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
             "os_version": UIDevice.current.systemVersion,
@@ -229,8 +239,12 @@ final class Recorder: ObservableObject {
         Task {
             let r = await Analyzer.analyzeAsync(folder: folder)
             switch r {
-            case .success(let a): self.analysis = a
-            case .failure(let e): self.analysisError = e.localizedDescription
+            case .success(let a):
+                self.analysis = a
+                self.speak(self.spokenSummary(a))
+            case .failure(let e):
+                self.analysisError = e.localizedDescription
+                self.speak("Analysis failed. See the screen.")
             }
             self.analyzing = false
             self.recordings = SessionStore.list()
@@ -268,6 +282,37 @@ final class Recorder: ObservableObject {
     func delete(at offsets: IndexSet) {
         for i in offsets { try? FileManager.default.removeItem(at: recordings[i]) }
         recordings = SessionStore.list()
+    }
+
+    /// Short spoken result, because the screen faces the chest. Spoken only after recording ends.
+    func spokenSummary(_ r: AnalysisResult) -> String {
+        let red = r.channels.first { $0.channel == "r" }?.mean ?? .nan
+        if red.isFinite && red < 60 {
+            return "Finger signal too dark. The flash light is not reaching the camera. Move your finger, or try another lens."
+        }
+        if red.isFinite && red > 245 {
+            return "Finger signal too bright. Press a little lighter."
+        }
+        if let t = r.tap {
+            return "Found \(t.accTaps) taps in the accelerometer and \(t.ppgEvents) in the camera. "
+                + (t.paired >= 4 ? "Good." : "Too few matched. Tap firmer, about every 4 seconds.")
+        }
+        var parts: [String] = []
+        if r.hrPpg.isFinite { parts.append("Heart rate \(Int(r.hrPpg.rounded())).") }
+        let b = r.bestLock
+        if r.mode == "table" {
+            parts.append(b.isFinite ? (b > 3 ? "Warning. Finger pulse is leaking into the accelerometer." : "No pulse leak. Good.")
+                         : "Not enough beats.")
+        } else if !b.isFinite {
+            parts.append("Not enough beats for the heartbeat check.")
+        } else if b > 6 {
+            parts.append("Heartbeat clear in the chest signal.")
+        } else if b > 3 {
+            parts.append("Heartbeat weak in the chest signal.")
+        } else {
+            parts.append("No heartbeat found in the chest signal. Try moving the phone along the breastbone.")
+        }
+        return parts.joined(separator: " ")
     }
 
     private func speak(_ text: String) {
