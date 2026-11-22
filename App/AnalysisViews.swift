@@ -124,6 +124,14 @@ struct VerdictRows: View {
                 Text("Do 3 repeats. A steady offset between repeats matters more than a zero offset.")
                     .font(.caption).foregroundColor(.secondary)
             } else {
+                if let g = r.grade {
+                    ResultLine(label: "Recording grade", value: g.good ? "Good" : "Weak", ok: g.good)
+                    ForEach(g.reasons, id: \.self) { reason in
+                        Text("• " + reason).font(.caption).foregroundColor(.orange)
+                    }
+                    ResultLine(label: "Placement", value: Analyzer.placementName(r.placement)
+                               + ((r.extended ?? false) ? " · extended to 60 s" : ""), ok: nil)
+                }
                 ResultLine(label: "Heart rate (finger / chest)", value: hrText, ok: nil)
                 ResultLine(label: "Finger beats passing quality", value: "\(r.nPpgOk) / \(r.nBeats)",
                            ok: r.nPpgOk >= Analyzer.minValidBeats)
@@ -153,8 +161,8 @@ struct VerdictRows: View {
             ForEach(r.warnings, id: \.self) { w in
                 Text(w).font(.caption).foregroundColor(.red)
             }
-            if r.version < 2 && r.tap == nil {
-                Text("Analysed with an older app version. Re-analyse to use the current heartbeat check.")
+            if r.version < 3 && r.tap == nil {
+                Text("Analysed with an older app version. Re-analyse to use version 2 (corrected chest-signal direction, Good/Weak grade).")
                     .font(.caption).foregroundColor(.orange)
             }
         }
@@ -463,12 +471,33 @@ struct CompareRow: View {
     var detail: String {
         guard let r = item.result else { return "not analysed yet" }
         if let t = r.tap { return "tap: offset \(fmt(t.offsetMedianMs)) ms, SD \(fmt(t.offsetSdMs)) ms, \(t.paired) taps" }
-        var s = (r.isFlagged ? "⚑ flagged · " : "") + "\(r.mode) · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 2 ? " (old analysis)" : "")
+        var s = (r.isFlagged ? "⚑ flagged · " : "") + "\(r.mode)"
+        if let g = r.grade { s += g.good ? " · Good" : " · Weak" }
+        if r.placement == "diaphragm" { s += " · diaphragm" }
+        s += " · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 3 ? " (old analysis)" : "")
         if r.mode == "chest", let f = r.fixed {
             s += " · PTT \(fmt(f.pttMedianMs, "%.0f")) ± \(fmt(f.pttRobustSdMs, "%.0f")) ms"
         }
         if r.pirMedian.isFinite { s += " · PIR \(fmt(r.pirMedian, "%.3f"))" }
         return s
+    }
+}
+
+struct PlacementSummary: View {
+    let name: String
+    let rows: [AnalysisResult]
+
+    var body: some View {
+        let ptt = rows.filter { $0.grade?.good == true }.compactMap { $0.grade?.pttMedianMs }.filter { $0.isFinite }
+        let locks = rows.map { $0.bestLock }.filter { $0.isFinite }
+        let good = rows.filter { $0.grade?.good == true }.count
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(name).font(.callout.bold())
+            Text("\(rows.count) recordings, \(good) Good · heartbeat ratio (median) \(fmt(DSP.median(locks)))")
+                .font(.caption)
+            Text("PTT (Good only): mean \(fmt(DSP.mean(ptt), "%.0f")) ms, SD \(fmt(DSP.sampleSD(ptt))) ms")
+                .font(.caption)
+        }
     }
 }
 
@@ -481,11 +510,21 @@ struct CompareView: View {
     var results: [AnalysisResult] { items.compactMap { $0.result } }
     var currentSetup: Int { ColourProfile.setup }
     var chestAll: [AnalysisResult] { results.filter { $0.mode == "chest" } }
-    /// Chest recordings that count: not flagged, and from the current finger-colour choice.
-    var chest: [AnalysisResult] {
-        chestAll.filter { !$0.isFlagged && (currentSetup == 0 || $0.colourSetup == currentSetup) }
+    /// Recordings from the current finger-colour choice that aren't flagged.
+    var chestUsable: [AnalysisResult] {
+        chestAll.filter { !$0.isFlagged && (currentSetup == 0 || $0.colourSetup == currentSetup) && $0.version >= 3 }
     }
-    var detected: [AnalysisResult] { chest.filter { $0.scgDetected == true } }
+    /// Main results: lower breastbone only.
+    var chest: [AnalysisResult] { chestUsable.filter { ($0.placement ?? "sternum") == "sternum" } }
+    /// Version 2: only recordings graded Good count for PTT.
+    var detected: [AnalysisResult] { chest.filter { $0.grade?.good == true } }
+    var oldCount: Int { chestAll.filter { $0.version < 3 }.count }
+
+    func placementRows(_ p: String) -> [AnalysisResult] { chestUsable.filter { ($0.placement ?? "sternum") == p } }
+    func goodPTT(_ rs: [AnalysisResult]) -> [Double] {
+        rs.filter { $0.grade?.good == true }.compactMap { $0.grade?.pttMedianMs }.filter { $0.isFinite }
+    }
+    var placementDiff: Double { DSP.mean(goodPTT(placementRows("diaphragm"))) - DSP.mean(goodPTT(placementRows("sternum"))) }
     var pttMedians: [Double] { detected.compactMap { $0.fixed?.pttMedianMs }.filter { $0.isFinite } }
     var pttWithin: [Double] { detected.compactMap { $0.fixed?.pttRobustSdMs }.filter { $0.isFinite } }
     var tapOffsets: [Double] { results.compactMap { $0.tap?.offsetMedianMs }.filter { $0.isFinite } }
@@ -500,15 +539,27 @@ struct CompareView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Chest + finger at rest") {
-                ResultLine(label: "Heartbeat detected", value: "\(detected.count) of \(chest.count) recordings", ok: nil)
-                if chestAll.count > chest.count {
-                    Text("\(chestAll.count - chest.count) chest recording(s) not counted: flagged, or from an earlier finger-colour choice.")
+                ResultLine(label: "Graded Good", value: "\(detected.count) of \(chest.count) recordings", ok: nil)
+                if oldCount > 0 {
+                    Text("\(oldCount) chest recording(s) analysed with an older version: tap Re-analyse all recordings.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+                if chestAll.count - oldCount > chestUsable.count {
+                    Text("\(chestAll.count - oldCount - chestUsable.count) chest recording(s) not counted: flagged, or from an earlier finger-colour choice.")
                         .font(.caption).foregroundColor(.orange)
                 }
                 ResultLine(label: "PTT, mean of recordings", value: "\(fmt(DSP.mean(pttMedians), "%.0f")) ms", ok: nil)
                 ResultLine(label: "PTT spread between recordings (SD)", value: "\(fmt(DSP.sampleSD(pttMedians))) ms", ok: nil)
                 ResultLine(label: "Typical spread within a recording", value: "\(fmt(DSP.median(pttWithin))) ms", ok: nil)
-                Text("Uses the fixed method and only recordings where a heartbeat was detected. At rest, repeatable PTT means recordings agree closely: the spread between recordings should be small, not much larger than the spread within one.")
+                Text("Lower breastbone only, fixed method, only recordings graded Good. Pass marks set in advance: Good in at least 4 of 5, spread within each 10 ms or less, spread between recordings 15 ms or less.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Placement test") {
+                ForEach(["sternum", "diaphragm"], id: \.self) { p in
+                    PlacementSummary(name: Analyzer.placementName(p).capitalized, rows: placementRows(p))
+                }
+                ResultLine(label: "PTT difference (diaphragm − breastbone)", value: "\(fmt(placementDiff, "%+.0f")) ms", ok: nil)
+                Text("If the diaphragm area works, it should give mostly Good recordings and a PTT within a few ms of the breastbone. A clearly different PTT means it picks up something else (for example the pulse of the main artery). Judgement, not proof: needs several recordings at each place.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Tap sync") {

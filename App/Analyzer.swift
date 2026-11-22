@@ -23,6 +23,18 @@ struct ChannelQuality: Codable {
     var reason = ""
 }
 
+/// Good / Weak grade of a chest recording, from the fixed method (version 2).
+struct Grade: Codable {
+    var good = false
+    var reasons: [String] = []
+    var lock = Double.nan           // heartbeat ratio, out-of-chest axis, 60-400 ms before the finger pulse
+    var halvesMatch = Double.nan    // averaged heartbeat of odd vs even beats (1 = identical)
+    var secondPeak = Double.nan     // next-biggest bump / valve-opening bump
+    var pttMedianMs = Double.nan
+    var pttSpreadMs = Double.nan
+    var beats = 0
+}
+
 struct StreamRate: Codable {
     var name = ""
     var n = 0
@@ -37,8 +49,9 @@ struct BandLock: Codable {
     var ratio = Double.nan          // before the pulse only (60-400 ms before the finger-pulse foot)
     var snrDb = Double.nan
     var verdict = ""
-    var axis: String?              // "dv" = out of the chest (-z), "pca" = best direction. nil = analysed before 0.3.2
+    var axis: String?              // "dv" = out of the chest, "pca" = best direction. nil = analysed before 0.3.2
     var ratioAll: Double?          // whole window (500 ms before to 100 ms after the foot)
+    var used: Bool?                // true = the one decisions use (version 2: out-of-chest, 5-40 Hz)
 }
 
 struct Combo: Codable, Identifiable {
@@ -99,7 +112,10 @@ struct PlotData: Codable {
 }
 
 struct AnalysisResult: Codable {
-    var version = 2
+    var version = 3
+    var grade: Grade?
+    var placement: String?
+    var extended: Bool?
     var lens: String?
     var torchPct: Double?
     var lightDriftPct: Double?
@@ -139,8 +155,11 @@ struct AnalysisResult: Codable {
 
     var isFlagged: Bool { !(flags ?? []).isEmpty }
 
-    /// The ratio decisions use: out-of-chest axis, before the pulse (older results: whatever was saved).
+    /// The ratio decisions use: out-of-chest axis, 5-40 Hz, before the pulse (older results: whatever was saved).
     var bestLock: Double {
+        if locks.contains(where: { $0.used == true }) {
+            return locks.first(where: { $0.used == true })?.ratio ?? .nan
+        }
         let v = locks.filter { $0.axis == nil || $0.axis == "dv" }.map { $0.ratio }.filter { $0.isFinite }
         return v.max() ?? .nan
     }
@@ -179,6 +198,8 @@ struct SessionData {
     var colourSetup: Int?
     var flags: [String] = []
     var flashRaised: Bool?
+    var placement: String?
+    var extended: Bool?
     var ppg: [String: [Double]] = [:]
     var ppgRecord: [Bool] = []
     var acc: [String: [Double]] = [:]
@@ -221,6 +242,17 @@ enum Analyzer {
     static let features = ["apg_peak", "tangent_foot", "max_slope"]
     static let methods = ["rule", "ensemble", "scg_first"]
     static let fixedMethod = "ensemble", fixedAxis = "dv", fixedFeature = "tangent_foot"
+    /// Version 2: the 5-40 Hz band (index 1) decides the heartbeat check, the fixed PTT and the grade.
+    static let fixedBandIndex = 1
+    static let gradeLockMin = 6.0, gradeHalvesMin = 0.8, gradeSecondMax = 0.75, gradeSpreadMaxMs = 10.0
+
+    static func placementName(_ p: String?) -> String {
+        switch p {
+        case "diaphragm": return "diaphragm area"
+        case "sternum": return "lower breastbone"
+        default: return "breastbone (not recorded)"
+        }
+    }
 
     static func featureName(_ f: String) -> String {
         switch f {
@@ -287,6 +319,8 @@ enum Analyzer {
         d.colourSetup = meta["colour_setup"] as? Int
         d.flags = meta["flags"] as? [String] ?? []
         d.flashRaised = meta["flash_raised"] as? Bool
+        d.placement = meta["placement"] as? String
+        d.extended = meta["extended"] as? Bool
         let p = try readCSV(folder.appendingPathComponent("ppg.csv"))
         d.ppg = p.cols
         let pn = p.cols["t"]?.count ?? 0
@@ -412,17 +446,17 @@ enum Analyzer {
 
     /// Quality of one colour at the camera's own rate. Returns the quality and the times of the clean pulses.
     static func channelQuality(t: [Double], col: [Double], ch: String, fs: Double, t0: Double, t1: Double)
-        -> (ChannelQuality, [Double]) {
+        -> (ChannelQuality, [Double], [Double]) {
         var q = ChannelQuality()
         q.channel = ch
         let L = DSP.uniform(t, col, fs: fs, t0: t0, t1: t1).x
         q.mean = DSP.mean(L)
-        guard L.count > Int(10 * fs), q.mean.isFinite else { return (q, []) }
+        guard L.count > Int(10 * fs), q.mean.isFinite else { return (q, [], []) }
         let ac = DSP.bandpass(L, fs: fs, lo: 0.7, hi: 3.5)
         q.peakRatio = DSP.std(ac) > 0 ? DSP.spectralPeakRatio(ac, fs: fs, lo: 0.7, hi: 3.5) : 0
         let v = DSP.bandpass(L, fs: fs, lo: 0.5, hi: 10).map { -$0 }
         let hr = DSP.dominantHR(v, fs: fs)
-        guard hr.isFinite, hr > 0 else { return (q, []) }
+        guard hr.isFinite, hr > 0 else { return (q, [], []) }
         let T = 1 / hr
         let pk = DSP.findPeaks(v, distance: Int(0.6 * T * fs), wl: Int(1.5 * T * fs), minRelProm: 0.3)
         var feet: [Int] = []
@@ -436,7 +470,7 @@ enum Analyzer {
             peaks.append(i)
         }
         q.beats = feet.count
-        guard feet.count >= 5 else { return (q, []) }
+        guard feet.count >= 5 else { return (q, [], []) }
         var amps: [Double] = []
         for k in 0..<feet.count { amps.append(v[peaks[k]] - v[feet[k]]) }
         var ibi: [Double] = []
@@ -473,9 +507,10 @@ enum Analyzer {
                 q.shapeCorr = DSP.median(cs)
             }
         }
+        // red and green are compared on the pulse peak (steadier than the lowest point)
         var times: [Double] = []
-        for k in 0..<feet.count where ok[k] { times.append(t0 + Double(feet[k]) / fs) }
-        return (q, times)
+        for k in 0..<feet.count where ok[k] { times.append(t0 + Double(peaks[k]) / fs) }
+        return (q, times, peaks.map { t0 + Double($0) / fs })
     }
 
     /// Pass/fail rules for a colour. Thresholds are judgement calls, checked on the first real recordings.
@@ -500,6 +535,7 @@ enum Analyzer {
     static func assessColours(t: [Double], cols: [String: [Double]], fs: Double, t0: Double, t1: Double) -> [ChannelQuality] {
         var qs: [ChannelQuality] = []
         var feet: [String: [Double]] = [:]
+        var allPeaks: [String: [Double]] = [:]
         for c in ["r", "g", "b"] {
             guard let col = cols[c] else { continue }
             let res = channelQuality(t: t, col: col, ch: c, fs: fs, t0: t0, t1: t1)
@@ -507,11 +543,13 @@ enum Analyzer {
             judge(&q)
             qs.append(q)
             feet[c] = res.1
+            allPeaks[c] = res.2
         }
+        // version 2: compare with every pulse found in the other colour, if it is bright enough and found 15+
         for i in qs.indices where qs[i].channel == "r" || qs[i].channel == "g" {
             let other = qs[i].channel == "r" ? "g" : "r"
-            guard let j = qs.firstIndex(where: { $0.channel == other }), qs[j].passed,
-                  let fo = feet[other], let fm = feet[qs[i].channel], !fm.isEmpty else { continue }
+            guard let j = qs.firstIndex(where: { $0.channel == other }), qs[j].mean >= 10, qs[j].beats >= 15,
+                  let fo = allPeaks[other], let fm = feet[qs[i].channel], !fm.isEmpty, !fo.isEmpty else { continue }
             var hit = 0
             for x in fm where fo.contains(where: { abs($0 - x) <= 0.05 }) { hit += 1 }
             qs[i].agreementPct = 100 * Double(hit) / Double(fm.count)
@@ -531,6 +569,145 @@ enum Analyzer {
             return a.peakRatio > b.peakRatio
         }
         return passing.first?.channel
+    }
+
+    static func pearson(_ x: [Double], _ y: [Double]) -> Double {
+        let n = min(x.count, y.count)
+        guard n > 2 else { return .nan }
+        let mx = DSP.mean(Array(x.prefix(n))), my = DSP.mean(Array(y.prefix(n)))
+        var sxy = 0.0, sxx = 0.0, syy = 0.0
+        for i in 0..<n {
+            let a = x[i] - mx, b = y[i] - my
+            sxy += a * b
+            sxx += a * a
+            syy += b * b
+        }
+        return sxx > 0 && syy > 0 ? sxy / sqrt(sxx * syy) : .nan
+    }
+
+    /// Good / Weak from the fixed method's results. Same rules as hc_analyze.py version 2.
+    static func gradeFrom(lock: Double, ens: EnsembleInfo?, combo: Combo?) -> Grade {
+        var g = Grade()
+        g.lock = lock
+        if let c = combo {
+            g.pttMedianMs = c.pttMedianMs
+            g.pttSpreadMs = c.pttRobustSdMs
+            g.beats = c.valid
+        }
+        var aoFound = false
+        if let e = ens, e.S.count >= 6 {
+            let pre = e.pre
+            let a = pre - Int(pttHi * fsHi), b = pre - Int(pttLo * fsHi)
+            var odd: [[Double]] = []
+            var even: [[Double]] = []
+            for (i, row) in e.S.enumerated() {
+                if i % 2 == 0 { even.append(row) } else { odd.append(row) }
+            }
+            let mo = DSP.columnMedian(odd), me = DSP.columnMedian(even)
+            if a >= 0, b > a, b <= mo.count, b <= me.count {
+                g.halvesMatch = pearson(Array(mo[a..<b]), Array(me[a..<b]))
+            }
+            if let ai = e.aoI, ai >= a, ai < b, a >= 0, b <= e.template.count {
+                aoFound = true
+                let seg = Array(e.template[a..<b])
+                let j = ai - a
+                let top = seg[j]
+                let rng = (seg.max() ?? 0) - (seg.min() ?? 0)
+                var best = -Double.infinity
+                for i in DSP.localMax(seg) where abs(i - j) > 15 && DSP.prominence(seg, i, seg.count) >= 0.2 * rng {
+                    best = max(best, seg[i])
+                }
+                g.secondPeak = (best.isFinite && top > 0) ? best / top : 0
+            }
+        }
+        var r: [String] = []
+        if g.beats < minValidBeats { r.append("fewer than \(minValidBeats) good beats") }
+        if !(g.lock > gradeLockMin) { r.append(String(format: "heartbeat not clear (ratio %.1f)", g.lock)) }
+        if !(g.halvesMatch >= gradeHalvesMin) { r.append(String(format: "beats not consistent (halves match %.2f)", g.halvesMatch)) }
+        if !aoFound {
+            r.append("valve-opening bump not found")
+        } else if !(g.secondPeak < gradeSecondMax) {
+            r.append(String(format: "two similar bumps (second %.2f of the first)", g.secondPeak))
+        }
+        if !(g.pttSpreadMs <= gradeSpreadMaxMs) { r.append(String(format: "PTT varies within the recording (%.1f ms)", g.pttSpreadMs)) }
+        g.reasons = r
+        g.good = r.isEmpty
+        return g
+    }
+
+    /// Fixed method only, on raw arrays (used during recording to decide whether to extend to 60 s).
+    static func gradeFixed(pt: [Double], pc: [String: [Double]], at: [Double], ac: [String: [Double]],
+                           t0: Double, t1: Double, fsP: Double, fsA: Double, channel: String) -> Grade {
+        var bad = Grade()
+        let P = ppgProcess(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1, force: channel)
+        let B = ppgBeats(P)
+        guard B.count >= 5 else {
+            bad.reasons = ["too few finger-pulse beats"]
+            return bad
+        }
+        let S = scgAxes(t: at, cols: ac, fs: fsA, t0: t0, t1: t1)
+        guard S.bands.count > fixedBandIndex, let full = S.sig[S.bands[fixedBandIndex] + "|dv"] else {
+            bad.reasons = ["accelerometer too slow for the 5-40 Hz band"]
+            return bad
+        }
+        let n = min(full.count, P.t.count)
+        let s = Array(full.prefix(n))
+        var rms: [Double] = []
+        for b in B {
+            let c = Int(((b.tPeak - t0) * fsHi).rounded())
+            let a = max(0, c - 500), e = min(s.count, c + 100)
+            if e > a {
+                var q = 0.0
+                for i in a..<e { q += s[i] * s[i] }
+                rms.append(sqrt(q / Double(e - a)))
+            } else {
+                rms.append(.nan)
+            }
+        }
+        let medR = DSP.median(rms)
+        var okPre = [Bool](repeating: false, count: B.count)
+        for k in 0..<B.count { okPre[k] = B[k].ok && rms[k] < 2.5 * medR }
+        let ft = B.map { $0.tangentFoot }
+        let res = detectAO(method: "ensemble", s: s, th0: t0, ft: ft, okPre: okPre, scgFirst: [])
+        var pv: [Double] = []
+        for k in 0..<B.count {
+            let p = ft[k] - res.ao[k]
+            if okPre[k] && p.isFinite && p >= pttLo && p <= pttHi { pv.append(p * 1000) }
+        }
+        var c = Combo()
+        c.valid = pv.count
+        c.beats = B.count
+        c.pttMedianMs = DSP.median(pv)
+        c.pttRobustSdMs = DSP.robustSD(pv)
+        let okT = B.filter { $0.ok && $0.tangentFoot.isFinite }.map { $0.tangentFoot }
+        let lk = DSP.beatLock(s, th0: t0, fs: fsHi, times: okT, winS: (-pttHi, -pttLo))
+        return gradeFrom(lock: lk.ratio, ens: res.ens, combo: c)
+    }
+
+    /// Quick grade of the samples recorded so far (fixed method, saved or best colour).
+    static func quickGrade(ppg: [PPGSample], acc: [XYZSample], channel: String?) -> Grade {
+        var bad = Grade()
+        guard ppg.count > 100, acc.count > 100, let p0 = ppg.first?.t, let p1 = ppg.last?.t,
+              let a0 = acc.first?.t, let a1 = acc.last?.t else {
+            bad.reasons = ["too little data"]
+            return bad
+        }
+        let pt = ppg.map { $0.t }
+        let pc: [String: [Double]] = [
+            "r": ppg.map { Double($0.r) }, "g": ppg.map { Double($0.g) }, "b": ppg.map { Double($0.b) },
+            "sat_any": ppg.map { Double($0.satAny) },
+        ]
+        let at = acc.map { $0.t }
+        let ac: [String: [Double]] = ["x": acc.map { $0.x }, "y": acc.map { $0.y }, "z": acc.map { $0.z }]
+        let t0 = max(p0, a0) + 1.0, t1 = min(p1, a1)
+        let fsP = DSP.rate(pt), fsA = DSP.rate(at)
+        guard t1 - t0 >= 10, fsP >= 10, fsA >= 20 else {
+            bad.reasons = ["too little data"]
+            return bad
+        }
+        var ch = channel
+        if ch == nil { ch = bestColour(assessColours(t: pt, cols: pc, fs: fsP, t0: t0, t1: t1)) }
+        return gradeFixed(pt: pt, pc: pc, at: at, ac: ac, t0: t0, t1: t1, fsP: fsP, fsA: fsA, channel: ch ?? "g")
     }
 
     static func ppgBeats(_ P: PPG) -> [Beat] {
@@ -611,14 +788,16 @@ enum Analyzer {
             S.bands.append(key)
             let nat = raw.map { DSP.bandpass($0, fs: fs, lo: lo, hi: hiEff) }
             var pc = DSP.topEigenvector3(DSP.cov3(nat))
-            if pc[2] > 0 { pc = pc.map { -$0 } }      // align with -z (screen against chest => -z is out of the chest)
+            // iOS reports minus the acceleration, so with the screen against the chest the out-of-chest
+            // movement shows as +z (version 2 fix; earlier versions used -z and saw the wave upside down)
+            if pc[2] < 0 { pc = pc.map { -$0 } }
             S.pcDir[key] = pc
             let up = nat.map { DSP.resampleLanczos($0, fsIn: fs, fsOut: fsHi) }
             let n = up.map { $0.count }.min() ?? 0
             var dv = [Double](repeating: 0, count: n)
             var pca = [Double](repeating: 0, count: n)
             for i in 0..<n {
-                dv[i] = -up[2][i]
+                dv[i] = up[2][i]
                 pca[i] = pc[0] * up[0][i] + pc[1] * up[1][i] + pc[2] * up[2][i]
             }
             S.sig[key + "|dv"] = dv
@@ -907,6 +1086,8 @@ enum Analyzer {
         var R = AnalysisResult()
         R.session = d.name
         R.mode = d.mode
+        R.placement = d.mode == "chest" ? (d.placement ?? "sternum") : nil
+        R.extended = d.extended
         R.lens = d.lens
         R.torchPct = d.torchPct
         R.device = d.device.isEmpty ? "" : "\(d.device), iOS \(d.os)"
@@ -1096,6 +1277,7 @@ enum Analyzer {
                 var entry = BandLock(band: band, ratio: lk.ratio, snrDb: lk.snrDb, verdict: lockVerdict(lk.ratio))
                 entry.axis = axis
                 entry.ratioAll = la.ratio
+                entry.used = axis == "dv" && S.bands.count > fixedBandIndex && band == S.bands[fixedBandIndex]
                 R.locks.append(entry)
             }
         }
@@ -1117,8 +1299,17 @@ enum Analyzer {
         let good = combos.filter { $0.valid >= minValidBeats && $0.yieldPct >= 50 }
             .sorted { ($0.pttRobustSdMs.isFinite ? $0.pttRobustSdMs : .infinity) < ($1.pttRobustSdMs.isFinite ? $1.pttRobustSdMs : .infinity) }
         R.ranked = Array(good.prefix(10))
-        let fixedKey = "\(fixedMethod)|\(S.bands.first ?? "")|\(fixedAxis)|\(fixedFeature)"
+        let fixedBand = S.bands.count > fixedBandIndex ? S.bands[fixedBandIndex] : (S.bands.last ?? "")
+        let fixedKey = "\(fixedMethod)|\(fixedBand)|\(fixedAxis)|\(fixedFeature)"
         R.fixed = combos.first { $0.key == fixedKey }
+        if d.mode == "chest" {
+            R.grade = gradeFrom(lock: R.bestLock, ens: ensStore[fixedKey], combo: R.fixed)
+            if R.gravity.count == 3 && !(R.gravity[1] < -0.6 && abs(R.gravity[0]) < 0.5) {
+                var fl = R.flags ?? []
+                fl.append(String(format: "Phone not upright during the recording (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", R.gravity[0], R.gravity[1]))
+                R.flags = fl
+            }
+        }
 
         var plotKey: String?
         if let st = store[fixedKey], st.valid.contains(true) {
@@ -1214,7 +1405,7 @@ enum Analyzer {
         var L: [String] = []
         L.append("Session: \(R.session)")
         L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.3.3)")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.4.0, analysis version 2)")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {
@@ -1269,6 +1460,12 @@ enum Analyzer {
                 var line = "  SCG \(lk.band) \(axisName(lk.axis)): before pulse \(f1(lk.ratio)) (\(lk.verdict))"
                 if let a = lk.ratioAll { line += ", whole window \(f1(a)) (\(lockVerdict(a)))" }
                 L.append(line)
+            }
+            if let g = R.grade {
+                L.append("")
+                L.append("GRADE: \(g.good ? "GOOD" : "WEAK")  (placement: \(placementName(R.placement))\((R.extended ?? false) ? ", extended to 60 s" : ""))")
+                L.append("  PTT \(f1(g.pttMedianMs)) ms, spread \(f1(g.pttSpreadMs)) ms, beats \(g.beats), heartbeat ratio \(f1(g.lock)), halves match \(String(format: "%.2f", g.halvesMatch)), second bump \(String(format: "%.2f", g.secondPeak))")
+                for r in g.reasons { L.append("  - \(r)") }
             }
             if let fx = R.fixed {
                 L.append("")

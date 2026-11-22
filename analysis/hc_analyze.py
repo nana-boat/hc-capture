@@ -33,6 +33,7 @@ CFG = dict(
     ptt_range=(0.060, 0.400),           # s, plausible AO -> fingertip window
     min_valid_beats=15,
     polarities=(+1,),                   # +1 = out of the chest, phone screen against chest. --explore-polarity adds -1
+    fixed_band_index=1,                 # version 2: the 5-40 Hz band decides the heartbeat check and the fixed PTT
     edge_trim=1.0,                      # s dropped at both ends of the record phase
 )
 FEATURES = ["apg_peak", "tangent_foot", "max_slope"]
@@ -301,7 +302,8 @@ def channel_quality(t, x, fs, t0, t1):
         tm = np.median(S, axis=0)
         if np.std(tm) > 0:
             q["shape"] = float(np.median(S @ ((tm - tm.mean()) / tm.std()) / S.shape[1]))
-    return q, t0 + feet[ok] / fs
+    # times used to check that red and green see the same beats: the pulse peak (steadier than the lowest point)
+    return q, (t0 + peaks[ok] / fs, t0 + peaks / fs)
 
 
 def judge(q):
@@ -321,13 +323,16 @@ def judge(q):
 def assess_colours(ppg, t0, t1):
     t = ppg["t"].to_numpy()
     fs = round(1 / np.median(np.diff(t)))
-    Q, F = {}, {}
+    Q, F, FA = {}, {}, {}
     for c in "rgb":
-        Q[c], F[c] = channel_quality(t, ppg[c].to_numpy(), fs, t0, t1)
+        Q[c], ft = channel_quality(t, ppg[c].to_numpy(), fs, t0, t1)
+        F[c], FA[c] = ft if isinstance(ft, tuple) else (ft, ft)
         judge(Q[c])
+    # version 2: compare with every pulse found in the other colour (not only its clean ones),
+    # as long as that colour is bright enough and found at least 15 pulses
     for c, o in (("r", "g"), ("g", "r")):
-        if Q[o]["passed"] and len(F[c]):
-            Q[c]["agree"] = 100 * float(np.mean([np.min(np.abs(F[o] - x)) <= 0.05 for x in F[c]]))
+        if Q[o]["mean"] >= 10 and Q[o]["beats"] >= 15 and len(F[c]) and len(FA[o]):
+            Q[c]["agree"] = 100 * float(np.mean([np.min(np.abs(FA[o] - x)) <= 0.05 for x in F[c]]))
     for c in "rgb":
         judge(Q[c])
     return Q
@@ -364,10 +369,10 @@ def scg_axes(acc, t0, t1, fs_hi):
         M = np.vstack([nat["x"], nat["y"], nat["z"]])
         w, V = np.linalg.eigh(np.cov(M))
         pc = V[:, -1]
-        if pc[2] > 0:           # align with -z (screen against chest => -z points out of the chest)
-            pc = -pc
+        if pc[2] < 0:           # align with +z: iOS reports minus the acceleration, so with the screen against
+            pc = -pc            # the chest the out-of-chest movement shows as +z (fixed in version 2)
         up = {a: filt_up(raw[a], fs, lo, hi_eff, fs_out=fs_hi) for a in "xyz"}
-        out[(key, "dv")] = -up["z"]
+        out[(key, "dv")] = up["z"]
         out[(key, "pca")] = pc[0] * up["x"] + pc[1] * up["y"] + pc[2] * up["z"]
         out[(key, "pca_dir")] = pc
     th = t0 + np.arange(len(out[(key, "dv")])) / fs_hi
@@ -588,6 +593,42 @@ def tap_sync(acc, P, t0, t1):
                 offset_sd_ms=1000 * float(np.std(off)) if len(off) > 1 else np.nan)
 
 
+# ----------------------------------------------------------------------------- Good / Weak grade (version 2)
+GRADE = dict(lock_min=6.0, halves_min=0.8, second_max=0.75, spread_max_ms=10.0)
+
+
+def grade_recording(lock, extra, row):
+    """Good if: heartbeat clear, both halves of the beats give the same averaged heartbeat, one valve-opening
+    bump stands out, PTT steady within the recording, and enough beats. Thresholds are judgement calls set
+    on the first 6 chest recordings; they are judged on new recordings only."""
+    g = dict(lock=lock, halves=np.nan, second=np.nan, ptt=np.nan, spread=np.nan, beats=0, reasons=[])
+    if row is not None:
+        g.update(ptt=float(row.ptt_median_ms), spread=float(row.ptt_robust_sd_ms), beats=int(row.valid))
+    if extra and extra.get("S") is not None and len(extra["S"]) >= 6:
+        S_, pre = extra["S"], extra["pre"]
+        a, b = pre - int(CFG["ptt_range"][1] * CFG["fs_hi"]), pre - int(CFG["ptt_range"][0] * CFG["fs_hi"])
+        mo, me = np.median(S_[1::2], axis=0)[a:b], np.median(S_[0::2], axis=0)[a:b]
+        if np.std(mo) > 0 and np.std(me) > 0:
+            g["halves"] = float(np.corrcoef(mo, me)[0, 1])
+        ai = extra.get("ao_i")
+        if ai is not None and a <= ai < b:
+            seg = extra["template"][a:b]
+            j = ai - a
+            top = seg[j]
+            rng = seg.max() - seg.min()
+            others = [seg[i] for i in local_max(seg) if abs(i - j) > 15 and prominence(seg, i, len(seg)) >= 0.2 * rng]
+            g["second"] = float(max(others) / top) if others and top > 0 else 0.0
+    r = g["reasons"]
+    if g["beats"] < CFG["min_valid_beats"]: r.append(f"fewer than {CFG['min_valid_beats']} good beats")
+    if not lock > GRADE["lock_min"]: r.append(f"heartbeat not clear (ratio {lock:.1f})")
+    if not g["halves"] >= GRADE["halves_min"]: r.append(f"beats not consistent (halves match {g['halves']:.2f})")
+    if not (extra and extra.get("ao_i") is not None): r.append("valve-opening bump not found")
+    elif not g["second"] < GRADE["second_max"]: r.append(f"two similar bumps (second {g['second']:.2f} of the first)")
+    if not g["spread"] <= GRADE["spread_max_ms"]: r.append(f"PTT varies within the recording ({g['spread']:.1f} ms)")
+    g["good"] = not r
+    return g
+
+
 # ----------------------------------------------------------------------------- one session
 def analyze(folder, channel=None, verbose=True):
     meta, ppg, acc, gyro, markers = load_session(folder)
@@ -600,7 +641,7 @@ def analyze(folder, channel=None, verbose=True):
         acc = acc[acc.phase == "record"]
     t0 = max(ppg.t.min(), acc.t.min()) + CFG["edge_trim"]
     t1 = min(ppg.t.max(), acc.t.max()) - CFG["edge_trim"]
-    lines = [f"Session: {os.path.basename(os.path.normpath(folder))}",
+    lines = [f"Session: {os.path.basename(os.path.normpath(folder))}   (hc_analyze version 2)",
              f"Mode: {meta.get('mode')}   Device: {meta.get('device_model')}   iOS {meta.get('os_version')}",
              f"Analysed span: {t1 - t0:.1f} s",
              "", "Capture quality"]
@@ -649,7 +690,7 @@ def analyze(folder, channel=None, verbose=True):
                    hr_ppg=60 * P["hr_hz"], ppg_channel=P["channel"],
                    cam_hz=rep[0]["rate_hz"], acc_hz=rep[1]["rate_hz"],
                    colour_source=source, colour_passed=bool(qu["passed"]), flagged=bool(flags),
-                   colour_setup=meta.get("colour_setup"))
+                   colour_setup=meta.get("colour_setup"), placement=meta.get("placement", "sternum"))
 
     if meta.get("mode") == "tap":
         ts = tap_sync(acc, P, t0, t1)
@@ -679,6 +720,12 @@ def analyze(folder, channel=None, verbose=True):
 
     S, th, fs_acc, grav = scg_axes(acc, t0, t1, fs_hi)
     lines += ["", f"SCG  gravity (g): x {grav['x']:+.2f} y {grav['y']:+.2f} z {grav['z']:+.2f}"]
+    if meta.get("mode") == "chest" and not (grav["y"] < -0.6 and abs(grav["x"]) < 0.5):
+        f_up = (f"Phone not upright during the recording (gravity x {grav['x']:+.2f}, y {grav['y']:+.2f}): "
+                "hold it with the long side along the breastbone, camera end towards your chin.")
+        flags.append(f_up)
+        lines.append(f"  FLAGGED: {f_up}")
+        summary["flagged"] = True
     n = min(len(th), len(P["t"]))
     combos, store = [], {}
     for (band, axis), sig in S.items():
@@ -733,7 +780,11 @@ def analyze(folder, channel=None, verbose=True):
                          f"whole window {lock_all:5.1f} ({verdict(lock_all)})")
             summary[f"scg_lock_{band}_{axis}"] = lock
             summary[f"scg_lockall_{band}_{axis}"] = lock_all
-    dv_locks = [v for k, v in summary.items() if k.startswith("scg_lock_") and k.endswith("_dv") and np.isfinite(v)]
+    bands_sorted = sorted({b for b, _ in S}, key=lambda b: float(b.split("-")[0]))
+    fixed_band = bands_sorted[min(CFG["fixed_band_index"], len(bands_sorted) - 1)]
+    summary["fixed_band"] = fixed_band
+    dv_locks = [summary.get(f"scg_lock_{fixed_band}_dv", np.nan)]
+    dv_locks = [v for v in dv_locks if np.isfinite(v)]
     any_locks = [v for k, v in summary.items() if k.startswith(("scg_lock_", "scg_lockall_")) and np.isfinite(v)]
     best_lock = max(dv_locks) if dv_locks else np.nan
     any_lock = max(any_locks) if any_locks else np.nan
@@ -751,6 +802,19 @@ def analyze(folder, channel=None, verbose=True):
     elif not best_lock > 3:
         lines.append("  WARNING: no heartbeat locked to the pulse in the out-of-chest SCG. The averaged method still")
         lines.append("  returns numbers from pure noise, so treat every PTT below as INVALID for this session.")
+    # version 2: grade the recording with the fixed method
+    if meta.get("mode") == "chest":
+        fk = ("ensemble", fixed_band, "dv", "+", "tangent_foot")
+        rowf = C[(C.method == "ensemble") & (C.band == fixed_band) & (C.axis == "dv") & (C.polarity == "+") &
+                 (C.feature == "tangent_foot")]
+        G = grade_recording(best_lock, store.get(fk, (None, None, None, None))[2], rowf.iloc[0] if len(rowf) else None)
+        summary.update(grade="Good" if G["good"] else "Weak", grade_reasons="; ".join(G["reasons"]),
+                       grade_halves=G["halves"], grade_second=G["second"], grade_ptt=G["ptt"], grade_spread=G["spread"])
+        lines += ["", f"GRADE: {'GOOD' if G['good'] else 'WEAK'}  (fixed method: template, {fixed_band}, out-of-chest axis, tangent foot)",
+                  f"  PTT {G['ptt']:.1f} ms, spread {G['spread']:.1f} ms, beats {G['beats']}, heartbeat ratio {G['lock']:.1f}, "
+                  f"halves match {G['halves']:.2f}, second bump {G['second']:.2f}"]
+        for rr in G["reasons"]:
+            lines.append(f"  - {rr}")
     good = C[(C.valid >= CFG["min_valid_beats"]) & (C.yield_pct >= 50)].sort_values("ptt_robust_sd_ms")
     summary.update(hr_scg=float(hr_scg))
     lines += ["", "PTT combinations ranked by within-recording spread (lower = more stable)",
@@ -779,7 +843,7 @@ def analyze(folder, channel=None, verbose=True):
     out.to_csv(os.path.join(outdir, "beats_best.csv"), index=False)
     # fixed default combination, for comparing sessions fairly
     dflt = C[(C.method == "ensemble") & (C.axis == "dv") & (C.polarity == "+") &
-             (C.feature == "tangent_foot") & (C.band == C.band.iloc[0])]
+             (C.feature == "tangent_foot") & (C.band == fixed_band)]
     if len(dflt):
         summary["default_ptt_ms"] = float(dflt.ptt_median_ms.iloc[0])
     for _, r in C.iterrows():

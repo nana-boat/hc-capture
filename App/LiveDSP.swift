@@ -46,14 +46,14 @@ enum LiveDSP {
         return tail(y, count: Int(show * fs), maxPoints: maxPoints)
     }
 
-    /// Chest accelerometer on the out-of-chest axis (-z), band-passed 5-40 Hz. Last `show` seconds.
+    /// Chest accelerometer on the out-of-chest axis (+z on iOS with the screen against the chest), 5-40 Hz.
     static func scgWave(_ s: [XYZSample], show: Double, maxPoints: Int = 400) -> [Double] {
         guard s.count > 20, let t0 = s.first?.t, let t1 = s.last?.t else { return [] }
         let t = s.map { $0.t }
         let fs = DSP.rate(t)
         guard fs >= 20 else { return [] }
         let z = DSP.uniform(t, s.map { $0.z }, fs: fs, t0: t0, t1: t1).x
-        let y = DSP.bandpass(z, fs: fs, lo: 5, hi: 40).map { -$0 }
+        let y = DSP.bandpass(z, fs: fs, lo: 5, hi: 40)
         return tail(y, count: Int(show * fs), maxPoints: maxPoints)
     }
 
@@ -103,7 +103,7 @@ enum LiveDSP {
             feet.append(t0 + Double(DSP.argmin(v, a, i)) / fsP)
         }
         let z = DSP.uniform(ta, acc.map { $0.z }, fs: fsA, t0: t0, t1: t1).x
-        let s = DSP.bandpass(z, fs: fsA, lo: 5, hi: 40).map { -$0 }
+        let s = DSP.bandpass(z, fs: fsA, lo: 5, hi: 40)
         let lk = DSP.beatLock(s, th0: t0, fs: fsA, times: feet, winS: (-0.4, -0.06))
         out.lock = lk.ratio
         out.n = lk.count
@@ -111,5 +111,52 @@ enum LiveDSP {
         out.startMs = -Double(Int(0.5 * fsA)) / fsA * 1000
         out.dtMs = 1000 / fsA
         return out
+    }
+
+    // MARK: positioning helpers (version 2)
+
+    /// Mean acceleration (gravity) over the samples: x across the phone, y along it, z through the screen.
+    static func gravity(_ s: [XYZSample]) -> (x: Double, y: Double, z: Double) {
+        guard !s.isEmpty else { return (0, 0, 0) }
+        var x = 0.0, y = 0.0, z = 0.0
+        for e in s { x += e.x; y += e.y; z += e.z }
+        let n = Double(s.count)
+        return (x / n, y / n, z / n)
+    }
+
+    /// Largest standard deviation of the three axes (g). Small = the phone is being held still.
+    static func shake(_ s: [XYZSample]) -> Double {
+        guard s.count > 10 else { return .infinity }
+        return max(DSP.std(s.map { $0.x }), max(DSP.std(s.map { $0.y }), DSP.std(s.map { $0.z })))
+    }
+
+    /// Time of the second tap of a double tap (two sharp jolts 0.12-0.7 s apart) after `after`, or nil.
+    /// A jolt must be at least 0.05 g above 5 Hz and well above the background (heartbeats are ~0.005-0.015 g).
+    static func doubleTap(_ s: [XYZSample], after: Double) -> Double? {
+        guard s.count > 60, let t0 = s.first?.t, let t1 = s.last?.t, t1 > t0 else { return nil }
+        let t = s.map { $0.t }
+        let fs = DSP.rate(t)
+        guard fs >= 50 else { return nil }
+        let mag = s.map { sqrt($0.x * $0.x + $0.y * $0.y + $0.z * $0.z) }
+        let u = DSP.uniform(t, mag, fs: fs, t0: t0, t1: t1)
+        let hp = DSP.bandpass(u.x, fs: fs, lo: 5, hi: 0.45 * fs).map { abs($0) }
+        guard hp.count == u.t.count, !hp.isEmpty else { return nil }
+        let med = DSP.median(hp)
+        let mad = DSP.median(hp.map { abs($0 - med) })
+        let thr = max(0.05, med + 8 * 1.4826 * mad)
+        var taps: [Double] = []
+        var last = -Double.infinity
+        for i in 0..<hp.count where hp[i] > thr {
+            let ti = u.t[i]
+            if ti - last > 0.1 { taps.append(ti) }
+            last = ti
+        }
+        let recent = taps.filter { $0 > after }
+        guard recent.count >= 2, recent.count <= 3 else { return nil }
+        for k in 1..<recent.count {
+            let d = recent[k] - recent[k - 1]
+            if d >= 0.12 && d <= 0.7 { return recent[k] }
+        }
+        return nil
     }
 }

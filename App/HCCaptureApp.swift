@@ -42,6 +42,24 @@ struct SetupView: View {
                 }
                 .pickerStyle(.segmented)
                 Text(rec.mode.instructions).font(.callout)
+                if rec.mode == .chest {
+                    Picker("Placement", selection: $rec.placement) {
+                        ForEach(BodyPlacement.allCases) { Text($0.title).tag($0) }
+                    }
+                    Text(rec.placement.instructions).font(.caption).foregroundColor(.secondary)
+                    Toggle("Placement test: alternate automatically", isOn: $rec.placementTest)
+                    if rec.placementTest {
+                        Text("Compares the lower breastbone with the diaphragm area. Rest 5 minutes, then do 6 recordings, 2 minutes apart: the app switches placement after each one (next: \(rec.placement.title)). Results are in Compare sessions > Placement test. Main results only use the lower breastbone.")
+                            .font(.caption).foregroundColor(.orange)
+                    }
+                    Picker("Start recording by", selection: $rec.startMethod) {
+                        ForEach(StartMethod.allCases) { Text($0.title).tag($0) }
+                    }
+                    if rec.startMethod == .doubleTap {
+                        Text("Double tap any part of the phone firmly with your other hand once the app says the phone is in place. If iPhone Back Tap is on (Settings > Accessibility > Touch > Back Tap), tap the edge instead or turn it off.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
             }
             Section("Camera") {
                 LensChooser(rec: rec)
@@ -69,8 +87,10 @@ struct SetupView: View {
                 if !rec.colourMessage.isEmpty {
                     Text(rec.colourMessage).font(.caption).foregroundColor(.orange)
                 }
-                Picker("Positioning time", selection: $rec.settle) {
-                    ForEach([7, 10, 15], id: \.self) { Text("\($0) s").tag($0) }
+                if !(rec.mode == .chest && rec.startMethod == .doubleTap) {
+                    Picker("Positioning time", selection: $rec.settle) {
+                        ForEach([7, 10, 15], id: \.self) { Text("\($0) s").tag($0) }
+                    }
                 }
             }
             Section("Settings") {
@@ -78,7 +98,13 @@ struct SetupView: View {
                     ForEach([60, 120, 240], id: \.self) { Text("\($0) fps").tag($0) }
                 }
                 Picker("Recording length", selection: $rec.duration) {
-                    ForEach([30, 60, 90], id: \.self) { Text("\($0) s").tag($0) }
+                    Text("45 s, up to 60 s if needed").tag(45)
+                    Text("60 s").tag(60)
+                    Text("90 s").tag(90)
+                }
+                if rec.duration == 45 {
+                    Text("Chest recordings stop at 45 s if the recording is already Good, otherwise they carry on to 60 s automatically. Other tests record 45 s.")
+                        .font(.caption).foregroundColor(.secondary)
                 }
                 Picker("Accelerometer request", selection: $rec.accHz) {
                     ForEach([100, 200, 400], id: \.self) { Text("\($0) Hz").tag($0) }
@@ -122,7 +148,8 @@ struct RunView: View {
 
     var title: String {
         switch rec.phase {
-        case .preparing: return "Place your finger and check the light bar. Camera is adjusting."
+        case .preparing:
+            return rec.usesDoubleTap ? "Positioning. Double tap the phone to start." : "Place your finger and check the light bar. Camera is adjusting."
         case .recording: return "Recording. Stay still."
         default: return "Saving…"
         }
@@ -153,6 +180,9 @@ struct RunView: View {
         ScrollView {
             VStack(spacing: 12) {
                 Text(title).font(.headline).multilineTextAlignment(.center).padding(.horizontal)
+                if !rec.prepStatus.isEmpty {
+                    Text(rec.prepStatus).font(.callout).foregroundColor(.orange).multilineTextAlignment(.center).padding(.horizontal)
+                }
                 Text("\(rec.remaining)")
                     .font(.system(size: 56, weight: .bold, design: .rounded))
                     .monospacedDigit()
@@ -165,7 +195,7 @@ struct RunView: View {
                         Text(hrText).font(.caption.bold())
                     }
                     Wave(values: rec.live.ppg).stroke(Color.red, lineWidth: 1.5).frame(height: 70)
-                    Text("Chest accelerometer (−z, 5–40 Hz)").font(.caption)
+                    Text("Chest accelerometer (out of the chest, 5–40 Hz)").font(.caption)
                     Wave(values: rec.live.scg).stroke(Color.blue, lineWidth: 1).frame(height: 70)
                     Text("Chest beat average, aligned to the finger pulse (last 20 s)").font(.caption)
                     TracePlot(values: rec.live.beat.avg, start: rec.live.beat.startMs, dx: rec.live.beat.dtMs,

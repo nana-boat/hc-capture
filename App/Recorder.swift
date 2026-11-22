@@ -15,9 +15,11 @@ enum Mode: String, CaseIterable, Identifiable {
     var instructions: String {
         switch self {
         case .chest:
-            return "Sit back, relaxed, hand near heart level. Hold the phone flat on the lower sternum, SCREEN AGAINST "
-                + "YOUR CHEST, rear camera facing out. Cover the camera and flash with your index fingertip, light steady "
-                + "pressure. Breathe normally, don't talk or move. You'll hear when recording starts and ends."
+            return "Sit back, relaxed, and rest for 5 minutes first. Tap Start, cover the camera and the flash with your "
+                + "index fingertip and check the light bar. Then put the phone on your chest: UPRIGHT (long side along the "
+                + "breastbone, camera end towards your chin), centred, SCREEN AGAINST YOUR CHEST, on skin or a thin top. "
+                + "The app tells you when the phone is in place and how the heartbeat looks. When you're ready, double tap "
+                + "the phone with your other hand; recording starts 3 seconds later. Breathe normally, don't talk or move."
         case .table:
             return "Lay the phone screen-down on a firm table. Rest your fingertip on the camera and flash with the same "
                 + "pressure as usual. The phone is not on your chest, so any 'heartbeat' found in the accelerometer "
@@ -31,6 +33,32 @@ enum Mode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Where the phone sits on the body (chest recordings). Saved with each recording.
+enum BodyPlacement: String, CaseIterable, Identifiable {
+    case sternum, diaphragm
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .sternum: return "Lower breastbone"
+        case .diaphragm: return "Diaphragm area (test)"
+        }
+    }
+    var instructions: String {
+        switch self {
+        case .sternum:
+            return "Bottom edge of the phone just above the bottom tip of the breastbone (where the ribs meet in a V), centred on the bone."
+        case .diaphragm:
+            return "Phone centred just BELOW the bottom tip of the breastbone, on the soft area where the ribs part. Keep it flat and still, press lightly. For women this sits below the bra band."
+        }
+    }
+}
+
+enum StartMethod: String, CaseIterable, Identifiable {
+    case doubleTap, countdown
+    var id: String { rawValue }
+    var title: String { self == .doubleTap ? "Double tap the phone" : "Countdown" }
+}
+
 enum Phase { case idle, preparing, recording, saving, done }
 
 struct LiveStats {
@@ -38,8 +66,8 @@ struct LiveStats {
     var r: Float = 0, g: Float = 0, b: Float = 0
     var sat: Float = 0, iso: Float = 0, expMs: Float = 0
     var ppg: [Double] = []          // finger pulse, filtered 0.5-10 Hz, last 4 s
-    var scg: [Double] = []          // chest -z, filtered 5-40 Hz, last 4 s
-    var beat = LiveBeat()           // heart rate + chest beat average, last 20 s
+    var scg: [Double] = []          // chest, out of the chest, filtered 5-40 Hz, last 4 s
+    var beat = LiveBeat()           // heart rate + chest beat average
 }
 
 struct ShareItem: Identifiable {
@@ -53,19 +81,27 @@ final class Recorder: ObservableObject {
     @Published var remaining = 0
     @Published var mode: Mode = .chest
     @Published var fps = 120
-    @Published var duration = 60
+    /// 45 = adaptive for chest recordings: 45 s, carried on to 60 s automatically if the recording isn't Good yet.
+    @Published var duration = 45
     @Published var accHz = 400
     /// Remembered between app launches, so every recording on this phone uses the same lens.
     @Published var lens: CameraLens = CameraLens.remembered() {
         didSet { UserDefaults.standard.set(lens.rawValue, forKey: "hc.lens") }
     }
-    /// Flash starts at 80% every recording and is raised (90%, then 100%) only while positioning, and only if
+    @Published var placement: BodyPlacement = .sternum
+    /// BodyPlacement test: switch between breastbone and diaphragm area after each chest recording.
+    @Published var placementTest = false
+    @Published var startMethod: StartMethod = StartMethod(rawValue: UserDefaults.standard.string(forKey: "hc.start") ?? "") ?? .doubleTap {
+        didSet { UserDefaults.standard.set(startMethod.rawValue, forKey: "hc.start") }
+    }
+    /// Flash starts at 70% every recording and is raised (80%, 90%, 100%) only while positioning, and only if
     /// the finger is too dim with the camera already at its most sensitive. It never changes during the recording.
-    let torchStartPct = 80
-    @Published var torchNowPct = 80
+    let torchStartPct = 70
+    @Published var torchNowPct = 70
     @Published var colourChannel: String? = ColourProfile.channel
     @Published var colourMessage = ""
     @Published var settle = 10
+    @Published var prepStatus = ""
     @Published var live = LiveStats()
     @Published var errorMessage: String?
     @Published var summary: [SummaryRow] = []
@@ -80,6 +116,8 @@ final class Recorder: ObservableObject {
     @Published var analysisError: String?
 
     var settleSeconds: Double { Double(settle) }
+    var usesDoubleTap: Bool { mode == .chest && startMethod == .doubleTap }
+    let doubleTapTimeout = 60.0
     private let camera = CameraPPG()
     private let motion = MotionSCG()
     private let speech = AVSpeechSynthesizer()
@@ -95,6 +133,24 @@ final class Recorder: ObservableObject {
     private var lastTorchStep = 0.0
     private var flags: [String] = []
     private var lightAtStart = 0.0
+    // positioning (double tap)
+    private var readySince: Double?
+    private var startPendingAt: Double?
+    private var lastSpeaking = 0.0
+    private var lastTipAt = 0.0
+    private var lastTip = ""
+    private var gravityAtStart: [Double] = []
+    private var recordPlacement: BodyPlacement = .sternum
+    private var recordStart = StartMethod.countdown
+    // adaptive length
+    private var adaptiveLength = false
+    private var lengthDecided = true
+    private var targetLength = 45.0
+    private var gradeRunning = false
+    private var extended = false
+    private var quickGrade: Grade?
+    private var finishing = false
+    private var cancelling = false
 
     func start() async {
         errorMessage = nil
@@ -113,6 +169,12 @@ final class Recorder: ObservableObject {
         markers = []
         lastSlow = 0; slow = LiveBeat(); liveChannel = ColourProfile.channel ?? "g"
         lastTorchStep = 0; flags = []; lightAtStart = 0; colourMessage = ""
+        readySince = nil; startPendingAt = nil; lastSpeaking = 0; lastTipAt = 0; lastTip = ""; gravityAtStart = []
+        adaptiveLength = false; lengthDecided = true; gradeRunning = false; extended = false; quickGrade = nil
+        finishing = false
+        cancelling = false
+        recordPlacement = placement
+        recordStart = usesDoubleTap ? .doubleTap : .countdown
         analysis = nil; analysisError = nil; analyzing = false
         cuffSBP = ""; cuffDBP = ""; notes = ""; savedNote = ""
         UIApplication.shared.isIdleTimerDisabled = true
@@ -120,11 +182,19 @@ final class Recorder: ObservableObject {
         UIDevice.current.isProximityMonitoringEnabled = true
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         try? AVAudioSession.sharedInstance().setActive(true)
-        speak(mode == .table ? "Place your finger on the camera, check the light bar, then lay the phone screen down."
-              : "Place your finger, check the light bar, then put the phone on your chest.")
-
+        switch mode {
+        case .table:
+            speak("Place your finger on the camera, check the light bar, then lay the phone screen down.")
+        case .tap:
+            speak("Place your finger, check the light bar, then put the phone on your chest.")
+        case .chest:
+            speak(usesDoubleTap
+                  ? "Place your finger and check the light bar. Then put the phone upright on your chest, and double tap it when you're ready."
+                  : "Place your finger, check the light bar, then put the phone upright on your chest.")
+        }
+        prepStatus = "Place your finger on the camera and check the light bar."
         phase = .preparing
-        remaining = Int(settleSeconds)
+        remaining = usesDoubleTap ? Int(doubleTapTimeout) : Int(settleSeconds)
         await camera.start()
         motion.start(hz: Double(accHz))
         tStart = HostClock.now
@@ -135,35 +205,203 @@ final class Recorder: ObservableObject {
 
     private func tick() {
         let now = HostClock.now
+        if speech.isSpeaking { lastSpeaking = now }
         switch phase {
         case .preparing:
-            let left = settleSeconds - (now - tStart)
-            remaining = max(0, Int(left.rounded(.up)))
-            // raise the flash one step if the finger is dim and the camera can't brighten any more by itself
-            if left > 1.5 && now - tStart > 3 && now - lastTorchStep > 2 && torchNowPct < 100 {
-                let light = recentLight(1.0)
-                if light > 0 && light < 150 && camera.atSensitivityLimit {
-                    torchNowPct = min(100, torchNowPct + 10)
-                    camera.setTorch(level: Double(torchNowPct) / 100)
-                    lastTorchStep = now
-                }
-            }
-            if left <= 0 {
-                checkLightAtStart()
-                camera.freezeExposure()
-                tRecord = HostClock.now
-                phase = .recording
-                // haptic only, no sound: the speaker would shake the accelerometer
-                UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+            if cancelling { break }
+            raiseFlashIfDim(now)
+            if usesDoubleTap {
+                prepareDoubleTap(now)
+            } else {
+                let left = settleSeconds - (now - tStart)
+                remaining = max(0, Int(left.rounded(.up)))
+                if left <= 0 { beginRecording() }
             }
         case .recording:
-            let left = Double(duration) - (now - tRecord)
-            remaining = max(0, Int(left.rounded(.up)))
-            if left <= 0 { Task { await finish() } }
+            let el = now - tRecord
+            if adaptiveLength && !lengthDecided {
+                if el >= 45 && !gradeRunning { runQuickGrade() }
+                if el >= 60 {
+                    lengthDecided = true
+                    targetLength = 60
+                    extended = true
+                }
+            }
+            remaining = max(0, Int((targetLength - el).rounded(.up)))
+            if el >= targetLength && lengthDecided && !finishing {
+                finishing = true
+                Task { await finish() }
+            }
         default:
             break
         }
         updateLive()
+    }
+
+    // MARK: positioning
+
+    private func fingerPresent() -> Bool {
+        let rp = camera.recent(seconds: 1.0)
+        guard rp.count > 10 else { return false }
+        var r = 0.0, g = 0.0
+        for p in rp { r += Double(p.r); g += Double(p.g) }
+        r /= Double(rp.count); g /= Double(rp.count)
+        return r > 20 && r > 1.8 * g
+    }
+
+    private struct Pose {
+        var upright = false, sideways = false, onChest = false
+        var g = (x: 0.0, y: 0.0, z: 0.0)
+    }
+
+    private func pose() -> Pose {
+        var p = Pose()
+        let a = motion.recentAcc(seconds: 1.0)
+        guard a.count > 20 else { return p }
+        p.g = LiveDSP.gravity(a)
+        p.upright = p.g.y < -0.6 && abs(p.g.x) < 0.5
+        p.sideways = abs(p.g.x) >= 0.6
+        // screen facing the chest: the proximity sensor is covered, or the screen is tilted towards the body
+        p.onChest = UIDevice.current.proximityState || p.g.z > -0.05
+        return p
+    }
+
+    /// Raise the flash one step (max 100%) if the finger is dim and the camera can't brighten any more by itself.
+    private func raiseFlashIfDim(_ now: Double) {
+        guard startPendingAt == nil, now - tStart > 3, now - lastTorchStep > 2, torchNowPct < 100 else { return }
+        if !usesDoubleTap && settleSeconds - (now - tStart) <= 1.5 { return }
+        let light = recentLight(1.0)
+        if fingerPresent() && light > 0 && light < 150 && camera.atSensitivityLimit {
+            torchNowPct = min(100, torchNowPct + 10)
+            camera.setTorch(level: Double(torchNowPct) / 100)
+            lastTorchStep = now
+        }
+    }
+
+    private func prepareDoubleTap(_ now: Double) {
+        let waited = now - tStart
+        remaining = max(0, Int((doubleTapTimeout - waited).rounded(.up)))
+        if let sp = startPendingAt {
+            prepStatus = "Starting… stay still."
+            if now - sp >= 3.0 && !speech.isSpeaking { beginRecording() }
+            return
+        }
+        if waited > doubleTapTimeout {
+            cancelling = true
+            Task { await cancelPreparing("No double tap within a minute. Stopped, flash off.") }
+            return
+        }
+        let p = pose()
+        let finger = fingerPresent()
+        let still = LiveDSP.shake(motion.recentAcc(seconds: 1.5)) < 0.05
+        if p.onChest && p.upright && finger {
+            if readySince == nil && still {
+                readySince = now
+                speakTip("Phone in place. Hold still. Double tap the phone when you're ready.", now)
+            }
+        } else {
+            readySince = nil
+        }
+        if !finger {
+            prepStatus = "Cover the camera and the flash with your fingertip."
+        } else if !p.onChest {
+            prepStatus = "Finger OK. Now put the phone on your chest, screen against you."
+        } else if p.sideways {
+            prepStatus = "Turn the phone upright, camera end towards your chin."
+        } else if !p.upright {
+            prepStatus = "Hold the phone upright, camera end towards your chin."
+        } else {
+            prepStatus = readySince == nil ? "Hold still…" : "In place. Double tap the phone to start."
+        }
+        // spoken tips every 8 s (a changed tip) or 16 s (the same tip); none while speaking
+        if !speech.isSpeaking && now - lastSpeaking > 0.5 && now - lastTipAt >= 8 && waited > 6 {
+            if let tip = positioningTip(p, finger: finger, now: now), tip != lastTip || now - lastTipAt >= 16 {
+                speakTip(tip, now)
+            }
+        }
+        // double tap: only once in place, and not right after the app has spoken (speech shakes the phone)
+        if let rs = readySince, now - rs >= 1.0, !speech.isSpeaking, now - lastSpeaking > 0.4 {
+            if LiveDSP.doubleTap(motion.recentAcc(seconds: 2.0), after: max(rs, lastSpeaking + 0.4)) != nil {
+                startPendingAt = now
+                speak("Starting in 3 seconds. Stay still.")
+                lastSpeaking = now
+            }
+        }
+    }
+
+    private func positioningTip(_ p: Pose, finger: Bool, now: Double) -> String? {
+        if !finger { return "Cover the camera and the flash with your fingertip." }
+        if !p.onChest { return nil }
+        if p.sideways { return "Turn the phone upright, camera end towards your chin." }
+        if !p.upright { return "Hold the phone upright on your chest, camera end towards your chin." }
+        guard let rs = readySince, now - rs >= 8 else { return nil }
+        let l = slow.lock
+        guard l.isFinite else { return nil }
+        if l > 6 { return "Heartbeat clear. Double tap when ready." }
+        if recordPlacement == .diaphragm {
+            return (l > 3 ? "Heartbeat weak." : "No heartbeat yet.") + " Keep the phone flat and still, and press lightly."
+        }
+        return l > 3 ? "Heartbeat weak. Try moving the phone a little lower on the breastbone."
+                     : "No heartbeat yet. Move the phone a little lower on the breastbone."
+    }
+
+    private func speakTip(_ text: String, _ now: Double) {
+        speak(text)
+        lastTip = text
+        lastTipAt = now
+        lastSpeaking = now
+    }
+
+    private func beginRecording() {
+        checkLightAtStart()
+        let p = pose()
+        gravityAtStart = [p.g.x, p.g.y, p.g.z]
+        if mode == .chest && !p.upright {
+            flags.append(String(format: "Phone not upright when recording started (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", p.g.x, p.g.y))
+        }
+        camera.freezeExposure()
+        tRecord = HostClock.now
+        adaptiveLength = mode == .chest && duration == 45
+        targetLength = Double(duration)
+        lengthDecided = !adaptiveLength
+        prepStatus = ""
+        phase = .recording
+        // haptic only, no sound: the speaker would shake the accelerometer
+        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    }
+
+    /// At 45 s: grade what has been recorded with the fixed method; Good -> stop, otherwise carry on to 60 s.
+    private func runQuickGrade() {
+        gradeRunning = true
+        let tr = tRecord
+        let p = camera.recent(seconds: 70).filter { $0.t >= tr }
+        let a = motion.recentAcc(seconds: 70).filter { $0.t >= tr }
+        let ch = ColourProfile.channel
+        Task {
+            let g = await Task.detached(priority: .userInitiated) { Analyzer.quickGrade(ppg: p, acc: a, channel: ch) }.value
+            self.quickGrade = g
+            guard self.phase == .recording, !self.lengthDecided else { return }
+            self.lengthDecided = true
+            if g.good {
+                self.targetLength = max(45, HostClock.now - self.tRecord)
+            } else {
+                self.targetLength = 60
+                self.extended = true
+            }
+        }
+    }
+
+    private func cancelPreparing(_ reason: String) async {
+        guard phase == .preparing else { return }
+        timer?.invalidate(); timer = nil
+        motion.stop()
+        await camera.stop()
+        UIApplication.shared.isIdleTimerDisabled = false
+        UIDevice.current.isProximityMonitoringEnabled = false
+        prepStatus = ""
+        phase = .idle
+        errorMessage = reason
+        speak(reason)
     }
 
     /// Mean of the brightest colour over the last `seconds` (0 if no frames yet).
@@ -203,7 +441,10 @@ final class Recorder: ObservableObject {
         let now = HostClock.now
         if now - lastSlow >= 1.0 {
             lastSlow = now
-            slow = LiveDSP.beatSummary(ppg: camera.recent(seconds: 20), acc: motion.recentAcc(seconds: 20),
+            // while positioning, only use the time since the phone has been in place
+            var w = 20.0
+            if phase == .preparing, let rs = readySince { w = min(20, max(7, now - rs)) }
+            slow = LiveDSP.beatSummary(ppg: camera.recent(seconds: w), acc: motion.recentAcc(seconds: w),
                                        channel: ColourProfile.channel)
             liveChannel = slow.channel
         }
@@ -217,8 +458,14 @@ final class Recorder: ObservableObject {
     func mark(at t: Double) { markers.append((t, "mark")) }
 
     func stopEarly() {
-        guard phase == .preparing || phase == .recording else { return }
-        if phase == .preparing { tRecord = HostClock.now }
+        if phase == .preparing {
+            guard !cancelling else { return }
+            cancelling = true
+            Task { await cancelPreparing("Stopped before recording started.") }
+            return
+        }
+        guard phase == .recording, !finishing else { return }
+        finishing = true
         Task { await finish() }
     }
 
@@ -239,16 +486,32 @@ final class Recorder: ObservableObject {
         let iso8601 = ISO8601DateFormatter()
         iso8601.formatOptions = [.withInternetDateTime]
         iso8601.timeZone = TimeZone.current
+        var qg: [String: Any] = [:]
+        if let g = quickGrade {
+            qg["good"] = g.good
+            qg["reasons"] = g.reasons
+            if g.pttMedianMs.isFinite { qg["ptt_ms"] = g.pttMedianMs }
+            if g.pttSpreadMs.isFinite { qg["spread_ms"] = g.pttSpreadMs }
+        }
+        let placementValue: Any = mode == .chest ? recordPlacement.rawValue : NSNull()
+        let quickValue: Any = qg.isEmpty ? NSNull() : qg
         meta = [
-            "app": "HC Capture 0.3.3",
+            "app": "HC Capture 0.4.0",
+            "analysis_version": 2,
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
             "os_version": UIDevice.current.systemVersion,
             "mode": mode.rawValue,
+            "placement": placementValue,
+            "placement_test": mode == .chest && placementTest,
+            "start_method": recordStart.rawValue,
             "fps_target": fps,
             "acc_rate_requested_hz": accHz,
             "duration_target_s": duration,
+            "length_rule": adaptiveLength ? "45 s, carried on to 60 s if not Good at 45 s" : "fixed",
+            "extended": extended,
+            "quick_grade_45s": quickValue,
             "settle_s": settleSeconds,
             "record_start_t": tRecord,
             "record_end_t": tEnd,
@@ -256,7 +519,9 @@ final class Recorder: ObservableObject {
             "camera": cameraInfo,
             "dropped_frames": dropped,
             "units": ["acc": "g", "gyro": "rad/s", "ppg": "mean 0-255 per channel"],
-            "orientation_protocol": mode == .table ? "screen down on table" : "screen against chest, -z = out of chest",
+            "orientation_protocol": mode == .table ? "screen down on table"
+                : "screen against chest, phone upright; iOS reports minus the acceleration, so +z = out of chest",
+            "gravity_at_start": gravityAtStart,
             "cuff_sbp": NSNull(), "cuff_dbp": NSNull(), "notes": "",
             "torch_level_start": Double(torchStartPct) / 100,
             "flash_raised": torchNowPct > torchStartPct,
@@ -278,6 +543,9 @@ final class Recorder: ObservableObject {
         }
         summary = rows
         recordings = SessionStore.list()
+        if mode == .chest && placementTest {
+            placement = recordPlacement == .sternum ? .diaphragm : .sternum
+        }
         phase = .done
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         speak("Done.")
@@ -389,6 +657,9 @@ final class Recorder: ObservableObject {
             && ColourProfile.channel == r.channel && (r.mode == "chest" || r.mode == "table") && !colourMessage.isEmpty {
             post = " Finger colour set to \(ColourProfile.name(r.channel))."
         }
+        if r.mode == "chest" && placementTest {
+            post += " Next placement: \(placement.title)."
+        }
         return pre + core + post
     }
 
@@ -411,14 +682,20 @@ final class Recorder: ObservableObject {
         if r.mode == "table" {
             parts.append(b.isFinite ? (b > 3 ? "Warning. Finger pulse is leaking into the accelerometer." : "No pulse leak. Good.")
                          : "Not enough beats.")
+            return parts.joined(separator: " ")
+        }
+        if let g = r.grade {
+            if g.good {
+                parts.append("Recording good.")
+            } else {
+                parts.append("Recording weak: \(g.reasons.first ?? "see the screen").")
+            }
         } else if !b.isFinite {
             parts.append("Not enough beats for the heartbeat check.")
         } else if b > 6 {
             parts.append("Heartbeat clear in the chest signal.")
-        } else if b > 3 {
-            parts.append("Heartbeat weak in the chest signal.")
         } else {
-            parts.append("No heartbeat found in the chest signal. Try moving the phone along the breastbone.")
+            parts.append("Heartbeat weak in the chest signal.")
         }
         return parts.joined(separator: " ")
     }
