@@ -136,14 +136,14 @@ enum SessionStore {
         guard rec.count > 10, ra.count > 10 else {
             return [SummaryRow(label: "Data", value: "too little data recorded", ok: false)]
         }
-        let dts = zip(rec.dropFirst(), rec).map { $0.t - $1.t }
+        let dts = Swift.zip(rec.dropFirst(), rec).map { $0.t - $1.t }
         let md = median(dts)
         let fps = 1 / md
         let gaps = dts.filter { $0 > 1.5 * md }.count
         rows.append(SummaryRow(label: "Camera rate", value: String(format: "%.1f fps (target %.0f)", fps, targetFPS),
                                ok: fps >= 0.9 * targetFPS))
         rows.append(SummaryRow(label: "Frame gaps / drops", value: "\(gaps) / \(dropped)", ok: gaps < 5))
-        let adt = median(zip(ra.dropFirst(), ra).map { $0.t - $1.t })
+        let adt = median(Swift.zip(ra.dropFirst(), ra).map { $0.t - $1.t })
         rows.append(SummaryRow(label: "Accelerometer rate", value: String(format: "%.1f Hz", 1 / adt), ok: 1 / adt >= 90))
         let n = Double(rec.count)
         let mr = rec.map { Double($0.r) }.reduce(0, +) / n
