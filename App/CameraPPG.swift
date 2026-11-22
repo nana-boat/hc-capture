@@ -48,7 +48,7 @@ enum CaptureError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noLens(let n): return "This phone has no \(n) camera."
-        case .noCamera: return "No rear camera found.\"
+        case .noCamera: return "No rear camera found."
         case .cannotAddInput: return "Could not open the camera."
         case .cannotAddOutput: return "Could not read camera frames."
         case .noFormat: return "No suitable camera format."
