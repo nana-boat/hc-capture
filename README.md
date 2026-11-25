@@ -1,112 +1,68 @@
 # HC Capture: HyperChat 3.0 signal feasibility kit
 
-Answers one question first: **can an iPhone capture usable chest SCG and fingertip PPG at the same time, and do the PTT and PIR measurements hold up?**
+HC Capture is an iPhone app that records two signals at the same time, using only the phone:
 
-RESEARCH PROTOTYPE. Not a medical device. The app shows no blood pressure.
+- **SCG** (seismocardiogram): the small movements of the chest caused by each heartbeat, read from the phone's accelerometer and gyroscope while the phone rests against the chest.
+- **PPG** (photoplethysmogram): the pulse in a fingertip, read from the rear camera and flash while a finger covers the lens.
 
-```
-HyperChatCapture/
-├── App/                    Swift source (native iOS, SwiftUI, no React)
-│   ├── HCCaptureApp.swift  screens
-│   ├── Recorder.swift      recording flow, voice cues, metadata
-│   ├── CameraPPG.swift     rear camera + torch, locked settings, per-frame timestamps
-│   ├── MotionSCG.swift     accelerometer + gyroscope at max rate
-│   └── SessionStore.swift  CSV/JSON saving, zip sharing, on-phone signal check
-├── Config/Info.plist
-├── project.yml             XcodeGen project (the .xcodeproj is generated in the cloud)
-├── codemagic.yaml          Codemagic build
-├── .github/workflows/      the same build on GitHub Actions (free option)
-└── analysis/hc_analyze.py  laptop analysis: AO, PTT, PIR, sync test, BP comparison
-```
+From the two signals it measures **pulse transit time (PTT)**: the time from the heart's aortic valve opening (seen in the chest signal) to the pulse arriving at the fingertip (seen in the camera signal).
+
+The long-term idea behind HyperChat is to see whether this time can be measured well enough, with an ordinary phone, to one day follow blood pressure without a cuff. This project is the first step: **can the phone capture both signals on one clock and measure PTT repeatably?**
+
+**RESEARCH PROTOTYPE. Not a medical device.** The app shows no blood pressure, and nothing here estimates it. Whether a per-person or a population calibration will ever be used has not been decided, and nothing in the app depends on it.
+
+## Where the work is now (25 Nov 2026)
+
+- **App:** version 0.4.1. It records camera, accelerometer and gyroscope together on one clock: camera about 120 frames per second, motion sensors about 99.5 readings per second.
+- **Analysis method:** version 2.1. It finds the heartbeat bump in the chest signal and the foot of the finger pulse, averages over many beats, and gives a PTT with a grade (Good or Weak) for each recording.
+- **Current test:** a set of pick checks (rules v4.1) was written, fingerprinted and fixed before any new recording was made. They are being judged once, on new recordings from two sessions on different days: one rested and one after activity. The first session is recorded.
+- **Next steps:** testing other chest placements, a second tester (a woman), and later a cuff step to compare PTT with blood pressure.
+- **Who has been tested:** one person (the author) so far.
 
 ## What the app records
 
 | File | Contents |
 |---|---|
-| `ppg.csv` | per frame: host-clock time, mean R/G/B, saturated-pixel fraction, ISO, exposure |
-| `acc.csv` | accelerometer x/y/z in g, CoreMotion timestamps (same clock as the camera) |
-| `gyro.csv` | gyroscope (tremor/motion checks) |
-| `markers.csv` | times you pressed **Mark** |
-| `meta.json` | device, frame rate, camera locks, record start/end, cuff BP you enter, notes |
+| `ppg.csv` | per camera frame: host-clock time, mean R/G/B, saturated-pixel fraction, ISO, exposure, phase (`settle` or `record`) |
+| `acc.csv` | accelerometer x/y/z in g, same clock as the camera, phase |
+| `gyro.csv` | gyroscope x/y/z in rad/s, same clock, phase |
+| `markers.csv` | times the user pressed **Mark** |
+| `meta.json` | device, app and analysis version, lens, flash level, phone orientation and tilt, flags, the app's own 45 s grade, cuff blood pressure and notes if entered |
 
-Camera: rear wide camera, torch on, highest frame rate up to your choice (60/120/240), HDR, stabilisation and low-light boost off, focus and white balance locked (fixed gains). Exposure adapts for 7 s while you get into position, then it's frozen for the whole recording. No video is stored.
+No video is stored. Only `record` rows are analysed.
 
-## 1. Build the app (Windows + iPhone, free)
+## Modes
 
-You need a GitHub account (free) and an Apple ID.
+- **Chest + finger:** the main mode. Phone against the chest, fingertip on the camera. Placement: lower breastbone (main) or diaphragm area (test).
+- **Table control:** phone lying screen-down on a table with a finger on the camera. It checks whether the finger pulse leaks into the accelerometer. It should show no heartbeat.
+- **Tap sync test:** taps on the camera, to check that camera and accelerometer timestamps agree.
+- **Phone test:** checks whether the phone gives motion data faster than about 100 readings per second.
 
-1. Make a new **GitHub repository** and upload the contents of this folder (`App`, `Config`, `project.yml`, `codemagic.yaml`, `.github`, `analysis`). The GitHub web page's "upload files" works from Windows.
-2. Pick one build service:
-   - **Codemagic**: sign in with GitHub, add the repo, choose "codemagic.yaml", start the `ios-unsigned` workflow, download `HCCapture-unsigned.ipa` from the build's artifacts.
-   - **GitHub Actions**: open the repo's **Actions** tab, choose "Build unsigned IPA", then **Run workflow**. Download the `HCCapture-unsigned-ipa` artifact (it's a zip with the .ipa inside).
-3. Install on the iPhone with **Sideloadly** (Windows):
-   - Install Sideloadly, plus iTunes and iCloud from Apple's website (not the Microsoft Store versions).
-   - Plug in the iPhone, drag the .ipa into Sideloadly, enter your Apple ID, click Start.
-   - On the iPhone: Settings > General > VPN & Device Management > trust your Apple ID. iOS 16+ also needs Settings > Privacy & Security > Developer Mode on (restart).
-   - With a free Apple ID the app stops opening after 7 days. Re-sideload it to renew. Your recordings stay on the phone.
+## PAT and PTT
 
-If a build fails, copy the red error lines from the build log and send them to me.
+- **PAT** (pulse arrival time) starts at the ECG R-wave. A phone has no ECG, so it cannot measure PAT.
+- **PTT** here runs from the chest valve-opening bump (SCG) to the finger pulse foot (PPG). It avoids the pre-ejection delay that is built into PAT.
 
-## 2. Recording plan for the feasibility test
-
-Do these in order. Each test answers one question.
-
-| # | Mode | Repeats | Question |
-|---|---|---|---|
-| 1 | Tap sync test | 3 | Do camera and accelerometer timestamps stay aligned, and is the offset stable? |
-| 2 | Table control | 2 | Does the finger's own pulse leak into the accelerometer? (Should show no heartbeat.) |
-| 3 | Chest + finger, at rest | 5 | Is a heartbeat visible in the SCG? How stable is PTT within a recording and between repeats? Which PPG colour works? |
-| 4 | Chest + finger, BP changes | 6+ | Do PTT and PIR move with cuff BP? Record at rest, after 2 min handgrip, after light exercise, lying vs sitting. Take a cuff reading straight after each recording and type it in. |
-
-Chest protocol: seated, leaning back slightly, **screen against the chest** on the lower sternum, rear camera facing out, index fingertip lightly covering the camera and flash. No talking, normal breathing. You hear "place the phone", then a vibration when recording starts, and "done" at the end. (There's no sound during recording, because the speaker would shake the accelerometer.)
-
-Use 120 fps unless the on-phone check shows dropped frames.
-
-## 3. Analyse on your laptop
-
-Install Python 3 from python.org, then in a terminal:
+## What is in this repository
 
 ```
-pip install numpy pandas matplotlib
-python analysis/hc_analyze.py --all path\to\Recordings
+├── App/                      Swift source (native iOS, SwiftUI)
+│   ├── HCCaptureApp.swift    screens
+│   ├── Recorder.swift        recording flow, metadata
+│   ├── CameraPPG.swift       rear camera and flash, locked settings, per-frame timestamps
+│   ├── MotionSCG.swift       accelerometer and gyroscope
+│   ├── SessionStore.swift    saving CSV/JSON, zip sharing
+│   ├── Analyzer.swift        on-phone analysis (port of analysis/hc_analyze.py)
+│   ├── AnalysisViews.swift   result screens and charts
+│   ├── DSP.swift, LiveDSP.swift   filters, peaks, live waveform
+│   ├── Profile.swift         saved finger colour
+│   └── FastSensorTest.swift  the phone test
+├── Config/Info.plist
+├── project.yml               XcodeGen project
+├── codemagic.yaml            Codemagic build
+├── .github/workflows/        GitHub Actions build (unsigned IPA)
+├── METHOD.md                 the analysis method, grade, pass marks, change history
+└── analysis/hc_analyze.py    laptop analysis, same method as the app
 ```
 
-Get the recordings off the phone with **Share all recordings (zip)** in the app (email, Drive, AirDrop to a friend's Mac, etc.), or via the Files app. Unzip them first.
-
-For each session you get `analysis/summary.txt` and charts:
-
-- **Capture quality**: real camera and accelerometer rates, timing jitter, gaps, whether exposure stayed fixed.
-- **PPG channels**: which colour has the clearest pulse, and PIR with its beat-to-beat variation.
-- **SCG beat-locked ratio**: is there a heartbeat in the accelerometer that is locked to the finger pulse? Above 6 is clear, 3–6 weak, under 3 none. *If it's under 3, PTT for that session is invalid.* The table control should be about 1.
-- **PTT table**: three AO methods (Seismo-style rule, beat-averaged template, SCG-first), two filter bands, two axes, and three PPG features (APG peak, tangent foot, max slope). Ranked by within-recording stability.
-- **Tap sync**: median offset and spread.
-- `--all` also writes `cross_session.txt`: for sessions with cuff readings, how well ln(PTT) or 1/PIR predicts DBP and SBP, using leave-one-out error compared with just predicting the average BP.
-
-### How the analysis was checked
-I tested it on simulated recordings where the true AO and pulse times were known:
-
-- tangent-foot timing: about −10 ms bias with 7 ms spread
-- beat-averaged AO: about 0 ms bias with 3–7 ms spread (about 10–14 ms at 60 fps)
-- Seismo-style per-beat rule: unreliable once noise is realistic
-
-It also confirmed two traps:
-
-- a flipped SCG sign shifts AO by about 30 ms but looks just as "stable", so the sign is fixed by the placement protocol
-- the averaged method returns numbers even from pure noise, which is why the beat-locked check exists
-
-Simulations are idealised, so real recordings decide what works.
-
-### Don't fool yourself
-Many method combinations plus few sessions means some combination will look good by chance. Use your first sessions to choose **one** combination, write it down, then judge it only on new sessions.
-
-## PAT vs PTT
-
-- **PAT** (pulse arrival time) starts at the ECG R-wave. A phone has no ECG, so it can't measure PAT.
-- **PTT** here runs from aortic valve opening (AO, from the SCG) to the finger pulse. This is what the app measures, and it avoids the pre-ejection delay that's built into PAT.
-- To compare against PAT you'd need an ECG with a shared clock, e.g. an AD8232 module on a microcontroller. That's a later add-on.
-
-## Known limits
-
-- iPhone accelerometer rate is usually capped near 100 Hz (10 ms steps). The analysis interpolates for finer timing, but real precision has to be measured.
-- Camera and CoreMotion timestamps should share the host clock. The tap test checks this on your phone.
-- iOS still applies some tone mapping, so PIR from a camera isn't perfectly linear. Compare PIR only between sessions with similar ISO/exposure, and check its test–retest stability first.
+For the analysis method and its change history, see `METHOD.md`.
