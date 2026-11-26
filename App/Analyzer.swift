@@ -250,16 +250,14 @@ enum Analyzer {
     static let fixedBandIndex = 1
     static let gradeLockMin = 6.0, gradeHalvesMin = 0.8, gradeSecondMax = 0.75, gradeSpreadMaxMs = 10.0
     /// Version 2.1 (METHOD.md): the 1-20 Hz band and the first 45 s must agree with the main result within 10 ms.
-    static let methodVersion = "2.1"
+    /// 2.2 (app 0.4.2): 2.1 plus the turn table per site. The grade itself is unchanged.
+    static let methodVersion = "2.2"
     static let agreeMaxMs = 10.0
     static let firstWindowS = 45.0
 
     static func placementName(_ p: String?) -> String {
-        switch p {
-        case "diaphragm": return "diaphragm area"
-        case "sternum": return "lower breastbone"
-        default: return "breastbone (not recorded)"
-        }
+        guard let p = p else { return "breastbone (not recorded)" }
+        return BodyPlacement(rawValue: p)?.name ?? p
     }
 
     static func featureName(_ f: String) -> String {
@@ -1380,9 +1378,13 @@ enum Analyzer {
             R.grade = g
             let upright = R.gravity.count == 3 && R.gravity[1] < -0.6 && abs(R.gravity[0]) < 0.5
             let sideways = R.gravity.count == 3 && abs(R.gravity[0]) >= 0.6 && abs(R.gravity[1]) < 0.5
-            if R.gravity.count == 3 && !(upright || (R.placement == "diaphragm" && sideways)) {
+            // 2.2: each site has its own expected turn (same table as the laptop site-test rules v1).
+            let site = BodyPlacement(rawValue: R.placement ?? "sternum") ?? .sternum
+            let turnOK = (upright && site.allowsUpright) || (sideways && site.allowsSideways)
+            if R.gravity.count == 3 && !turnOK {
                 var fl = R.flags ?? []
-                fl.append(String(format: "Phone not upright during the recording (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", R.gravity[0], R.gravity[1]))
+                fl.append("Phone not \(site.turnName) during the recording (\(site.name), "
+                          + String(format: "gravity x %+.2f, y %+.2f). ", R.gravity[0], R.gravity[1]) + site.turnTip)
                 R.flags = fl
             }
         }
@@ -1481,7 +1483,7 @@ enum Analyzer {
         var L: [String] = []
         L.append("Session: \(R.session)")
         L.append("Mode: \(R.mode)   Device: \(R.device)   Lens: \(R.lens ?? "main")   Flash: \(R.torchPct.map { String(format: "%.0f%%", $0) } ?? "100%")")
-        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture 0.4.1, analysis version 2.1)")
+        L.append("Analysed span: \(f1(R.spanS)) s   (analysed on the phone, HC Capture \(AppInfo.version), analysis version \(methodVersion))")
         L.append("")
         L.append("Capture quality")
         for r in R.rates {

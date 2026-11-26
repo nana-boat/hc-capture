@@ -12,12 +12,19 @@ enum Mode: String, CaseIterable, Identifiable {
         case .tap: return "Tap sync test"
         }
     }
+    var shortTitle: String {
+        switch self {
+        case .chest: return "Chest"
+        case .table: return "Table"
+        case .tap: return "Tap test"
+        }
+    }
     var instructions: String {
         switch self {
         case .chest:
             return "Sit back, relaxed, and rest for 5 minutes first. Tap Start, cover the camera and the flash with your "
-                + "index fingertip and check the light bar. Then put the phone on your chest: UPRIGHT (long side along the "
-                + "breastbone, camera end towards your chin), centred, SCREEN AGAINST YOUR CHEST, on skin or a thin top. "
+                + "index fingertip and check the light bar. Then put the phone on your chest at the chosen site, turned as shown, "
+                + "SCREEN AGAINST YOUR CHEST, on bare skin. "
                 + "The app tells you when the phone is in place and how the heartbeat looks. When you're ready, double tap "
                 + "the phone with your other hand; recording starts 3 seconds later. Breathe normally, don't talk or move."
         case .table:
@@ -33,23 +40,121 @@ enum Mode: String, CaseIterable, Identifiable {
     }
 }
 
-/// Where the phone sits on the body (chest recordings). Saved with each recording.
+/// Where the phone sits on the body (chest recordings). Saved with each recording as "placement".
+/// 0.4.2: the site-test sites. The codes and turns match the laptop rules (RULES_site_test_v1.md).
 enum BodyPlacement: String, CaseIterable, Identifiable {
-    case sternum, diaphragm
+    case sternum
+    case sternumSideways = "sternum_sideways"
+    case leftClavicle = "left_clavicle"
+    case manubrium
+    case rightClavicle = "right_clavicle"
+    case midSternum = "mid_sternum"
+    case diaphragm
     var id: String { rawValue }
     var title: String {
         switch self {
         case .sternum: return "Lower breastbone"
-        case .diaphragm: return "Diaphragm area (test)"
+        case .sternumSideways: return "Lower breastbone, sideways"
+        case .leftClavicle: return "Below left collarbone"
+        case .manubrium: return "Top of breastbone"
+        case .rightClavicle: return "Below right collarbone"
+        case .midSternum: return "Mid-breastbone"
+        case .diaphragm: return "Diaphragm area (old test)"
+        }
+    }
+    /// Lower-case name for sentences.
+    var name: String {
+        switch self {
+        case .sternum: return "lower breastbone"
+        case .sternumSideways: return "lower breastbone, sideways"
+        case .leftClavicle: return "below the left collarbone"
+        case .manubrium: return "top of the breastbone"
+        case .rightClavicle: return "below the right collarbone"
+        case .midSternum: return "mid-breastbone"
+        case .diaphragm: return "diaphragm area"
+        }
+    }
+    /// Short label for lists.
+    var short: String {
+        switch self {
+        case .sternum: return "breastbone"
+        case .sternumSideways: return "breastbone sideways"
+        case .leftClavicle: return "L collarbone"
+        case .manubrium: return "top of breastbone"
+        case .rightClavicle: return "R collarbone"
+        case .midSternum: return "mid-breastbone"
+        case .diaphragm: return "diaphragm"
+        }
+    }
+    var spokenWhere: String {
+        switch self {
+        case .sternum, .sternumSideways: return "on your lower breastbone"
+        case .leftClavicle: return "below your left collarbone"
+        case .manubrium: return "on the top of your breastbone"
+        case .rightClavicle: return "below your right collarbone"
+        case .midSternum: return "on the middle of your breastbone"
+        case .diaphragm: return "just below your breastbone"
+        }
+    }
+    /// The turn each site expects (upright: long side along the body; sideways: long side across it).
+    var allowsUpright: Bool { self == .sternum || self == .midSternum || self == .diaphragm }
+    var allowsSideways: Bool { self != .sternum && self != .midSternum }
+    var turnName: String {
+        allowsUpright && allowsSideways ? "upright or sideways" : (allowsUpright ? "upright" : "sideways")
+    }
+    var turnTitle: String {
+        allowsUpright && allowsSideways ? "Upright or sideways" : (allowsUpright ? "Upright" : "Sideways")
+    }
+    var turnTip: String {
+        switch self {
+        case .diaphragm: return "Lay the phone flat below the breastbone, upright or sideways."
+        case .sternum, .midSternum: return "Hold the phone upright, camera end towards your chin."
+        default: return "Turn the phone sideways: long side across your body, camera end towards the hand that holds it."
+        }
+    }
+    var weakTip: String {
+        switch self {
+        case .sternum: return "Try moving the phone a little lower on the breastbone."
+        case .diaphragm: return "Keep the phone flat and still, and press lightly."
+        default: return "Keep the phone flat and still. Shift it about 1 cm if needed."
         }
     }
     var instructions: String {
         switch self {
         case .sternum:
-            return "Bottom edge of the phone just above the bottom tip of the breastbone (where the ribs meet in a V), centred on the bone."
+            return "Upright: long side along the breastbone, camera end towards your chin. Bottom edge just above the bottom tip of the breastbone (where the ribs meet in a V), centred on the bone."
+        case .sternumSideways:
+            return "Sideways: long side across the body, camera end towards the hand that holds it. Centred on the lower breastbone, lower edge just above its bottom tip."
+        case .leftClavicle:
+            return "Sideways, below the LEFT collarbone: top edge 1 to 2 finger widths below the collarbone, inner end close to the breastbone."
+        case .manubrium:
+            return "Sideways, centred on the top of the breastbone: top edge just below the notch at the base of the neck."
+        case .rightClavicle:
+            return "Sideways, below the RIGHT collarbone: top edge 1 to 2 finger widths below the collarbone, inner end close to the breastbone."
+        case .midSternum:
+            return "Upright, centred halfway along the breastbone, camera end towards your chin."
         case .diaphragm:
             return "Phone centred just BELOW the bottom tip of the breastbone, on the soft area where the ribs part. Upright or sideways (long side across the body), whichever lies flatter. Keep it flat and still, press lightly. For women this sits below the bra band."
         }
+    }
+    /// Sites that can alternate with the lower breastbone.
+    static var testSites: [BodyPlacement] { allCases.filter { $0 != .sternum } }
+}
+
+/// Get-ready checklist item (information only: saved with the recording, never blocks it).
+struct ChecklistItem: Identifiable {
+    let key: String
+    let text: String
+    var id: String { key }
+
+    static func items(for mode: Mode) -> [ChecklistItem] {
+        let dnd = ChecklistItem(key: "do_not_disturb", text: "Do Not Disturb on, no calls allowed")
+        let finger = ChecklistItem(key: "finger_light_press", text: "Fingertip covers camera and flash, light steady press")
+        guard mode == .chest else { return [dnd, finger] }
+        return [dnd,
+                ChecklistItem(key: "rested_seated", text: "Rested 5 min, back supported, feet flat, legs uncrossed"),
+                ChecklistItem(key: "hands_warm", text: "Hands warm"),
+                finger]
     }
 }
 
@@ -89,8 +194,23 @@ final class Recorder: ObservableObject {
         didSet { UserDefaults.standard.set(lens.rawValue, forKey: "hc.lens") }
     }
     @Published var placement: BodyPlacement = .sternum
-    /// BodyPlacement test: switch between breastbone and diaphragm area after each chest recording.
-    @Published var placementTest = false
+    /// Site test (0.4.2): switch between the test site and the lower breastbone after each chest recording.
+    /// Turning it on starts with the test site.
+    @Published var placementTest = false {
+        didSet { if placementTest && !oldValue { placement = testSite } }
+    }
+    /// The site that alternates with the lower breastbone (never the breastbone itself).
+    @Published var testSite: BodyPlacement = .sternumSideways {
+        didSet { if placementTest && testSite != oldValue { placement = testSite } }
+    }
+    /// Get-ready checklist, saved with the recording (information only).
+    @Published var checklist: [String: Bool] = [:]
+    /// Recording clock for the screen, whole seconds.
+    @Published var elapsedS = 0
+    @Published var targetS = 45
+    /// The last recording, for the result screen.
+    @Published var lastLengthS = 0
+    @Published var lastTime = ""
     @Published var startMethod: StartMethod = StartMethod(rawValue: UserDefaults.standard.string(forKey: "hc.start") ?? "") ?? .doubleTap {
         didSet { UserDefaults.standard.set(startMethod.rawValue, forKey: "hc.start") }
     }
@@ -141,6 +261,8 @@ final class Recorder: ObservableObject {
     private var lastTip = ""
     private var gravityAtStart: [Double] = []
     private var recordPlacement: BodyPlacement = .sternum
+    private var recordPlacementTest = false
+    private var recordTestSite: BodyPlacement = .sternumSideways
     private var recordStart = StartMethod.countdown
     // adaptive length
     private var adaptiveLength = false
@@ -174,6 +296,11 @@ final class Recorder: ObservableObject {
         finishing = false
         cancelling = false
         recordPlacement = placement
+        recordPlacementTest = placementTest
+        recordTestSite = testSite
+        checklist = [:]
+        elapsedS = 0
+        targetS = duration
         recordStart = usesDoubleTap ? .doubleTap : .countdown
         analysis = nil; analysisError = nil; analyzing = false
         cuffSBP = ""; cuffDBP = ""; notes = ""; savedNote = ""
@@ -188,9 +315,10 @@ final class Recorder: ObservableObject {
         case .tap:
             speak("Place your finger, check the light bar, then put the phone on your chest.")
         case .chest:
+            let whereTo = "\(placement.turnName) \(placement.spokenWhere)"
             speak(usesDoubleTap
-                  ? "Place your finger and check the light bar. Then put the phone upright on your chest, and double tap it when you're ready."
-                  : "Place your finger, check the light bar, then put the phone upright on your chest.")
+                  ? "Place your finger and check the light bar. Then put the phone \(whereTo), and double tap it when you're ready."
+                  : "Place your finger, check the light bar, then put the phone \(whereTo).")
         }
         prepStatus = "Place your finger on the camera and check the light bar."
         phase = .preparing
@@ -228,6 +356,9 @@ final class Recorder: ObservableObject {
                 }
             }
             remaining = max(0, Int((targetLength - el).rounded(.up)))
+            let shownElapsed = min(Int(el), Int(targetLength)), shownTarget = Int(targetLength)
+            if shownElapsed != elapsedS { elapsedS = shownElapsed }
+            if shownTarget != targetS { targetS = shownTarget }
             if el >= targetLength && lengthDecided && !finishing {
                 finishing = true
                 Task { await finish() }
@@ -254,9 +385,10 @@ final class Recorder: ObservableObject {
         var g = (x: 0.0, y: 0.0, z: 0.0)
     }
 
-    /// Upright everywhere; for the diaphragm area sideways is allowed too (0.4.1).
+    /// The turn each site expects (0.4.2; same table as the laptop site-test rules v1).
     private func placedOK(_ p: Pose) -> Bool {
-        p.upright || (recordPlacement == .diaphragm && p.sideways && abs(p.g.y) < 0.5)
+        (recordPlacement.allowsUpright && p.upright)
+            || (recordPlacement.allowsSideways && p.sideways && abs(p.g.y) < 0.5)
     }
 
     private static func orientationName(_ g: [Double]) -> String {
@@ -318,12 +450,8 @@ final class Recorder: ObservableObject {
             prepStatus = "Cover the camera and the flash with your fingertip."
         } else if !p.onChest {
             prepStatus = "Finger OK. Now put the phone on your chest, screen against you."
-        } else if !placedOK(p) && recordPlacement == .diaphragm {
-            prepStatus = "Lay the phone flat below the breastbone, upright or sideways."
-        } else if p.sideways && !placedOK(p) {
-            prepStatus = "Turn the phone upright, camera end towards your chin."
         } else if !placedOK(p) {
-            prepStatus = "Hold the phone upright, camera end towards your chin."
+            prepStatus = recordPlacement.turnTip
         } else {
             prepStatus = readySince == nil ? "Hold still…" : "In place. Double tap the phone to start."
         }
@@ -346,18 +474,12 @@ final class Recorder: ObservableObject {
     private func positioningTip(_ p: Pose, finger: Bool, now: Double) -> String? {
         if !finger { return "Cover the camera and the flash with your fingertip." }
         if !p.onChest { return nil }
-        if !placedOK(p) && recordPlacement == .diaphragm { return "Lay the phone flat below the breastbone, upright or sideways." }
-        if p.sideways && !placedOK(p) { return "Turn the phone upright, camera end towards your chin." }
-        if !placedOK(p) { return "Hold the phone upright on your chest, camera end towards your chin." }
+        if !placedOK(p) { return recordPlacement.turnTip }
         guard let rs = readySince, now - rs >= 8 else { return nil }
         let l = slow.lock
         guard l.isFinite else { return nil }
         if l > 6 { return "Heartbeat clear. Double tap when ready." }
-        if recordPlacement == .diaphragm {
-            return (l > 3 ? "Heartbeat weak." : "No heartbeat yet.") + " Keep the phone flat and still, and press lightly."
-        }
-        return l > 3 ? "Heartbeat weak. Try moving the phone a little lower on the breastbone."
-                     : "No heartbeat yet. Move the phone a little lower on the breastbone."
+        return (l > 3 ? "Heartbeat weak. " : "No heartbeat yet. ") + recordPlacement.weakTip
     }
 
     private func speakTip(_ text: String, _ now: Double) {
@@ -372,7 +494,8 @@ final class Recorder: ObservableObject {
         let p = pose()
         gravityAtStart = [p.g.x, p.g.y, p.g.z]
         if mode == .chest && !placedOK(p) {
-            flags.append(String(format: "Phone not upright when recording started (gravity x %+.2f, y %+.2f). Hold it with the long side along the breastbone, camera end towards your chin.", p.g.x, p.g.y))
+            flags.append("Phone not \(recordPlacement.turnName) when recording started (\(recordPlacement.name), "
+                         + String(format: "gravity x %+.2f, y %+.2f). ", p.g.x, p.g.y) + recordPlacement.turnTip)
         }
         camera.freezeExposure()
         tRecord = HostClock.now
@@ -469,6 +592,14 @@ final class Recorder: ObservableObject {
 
     func mark() { markers.append((HostClock.now, "mark")) }
 
+    func toggleCheck(_ key: String) { checklist[key] = !(checklist[key] ?? false) }
+
+    private func checklistMeta() -> [String: Bool] {
+        var m: [String: Bool] = [:]
+        for item in ChecklistItem.items(for: mode) { m[item.key] = checklist[item.key] ?? false }
+        return m
+    }
+
     /// t = moment the press started (the button needs a hold, so the mark is back-dated to the press).
     func mark(at t: Double) { markers.append((t, "mark")) }
 
@@ -509,17 +640,26 @@ final class Recorder: ObservableObject {
             if g.pttSpreadMs.isFinite { qg["spread_ms"] = g.pttSpreadMs }
         }
         let placementValue: Any = mode == .chest ? recordPlacement.rawValue : NSNull()
+        let testSiteValue: Any = (mode == .chest && recordPlacementTest) ? recordTestSite.rawValue : NSNull()
+        let turnValue: Any = mode == .chest ? recordPlacement.turnName : NSNull()
+        lastLengthS = Int((tEnd - tRecord).rounded())
+        let hm = DateFormatter()
+        hm.dateFormat = "HH:mm"
+        lastTime = hm.string(from: Date())
         let quickValue: Any = qg.isEmpty ? NSNull() : qg
         meta = [
-            "app": "HC Capture 0.4.1",
-            "analysis_version": 2.1,
+            "app": "HC Capture \(AppInfo.version)",
+            "analysis_version": 2.2,
             "lens": lens.rawValue,
             "created_local": iso8601.string(from: Date()),
             "device_model": SessionStore.modelIdentifier,
             "os_version": UIDevice.current.systemVersion,
             "mode": mode.rawValue,
             "placement": placementValue,
-            "placement_test": mode == .chest && placementTest,
+            "placement_test": mode == .chest && recordPlacementTest,
+            "placement_test_site": testSiteValue,
+            "placement_turn": turnValue,
+            "checklist": checklistMeta(),
             "start_method": recordStart.rawValue,
             "fps_target": fps,
             "acc_rate_requested_hz": accHz,
@@ -535,7 +675,7 @@ final class Recorder: ObservableObject {
             "dropped_frames": dropped,
             "units": ["acc": "g", "gyro": "rad/s", "ppg": "mean 0-255 per channel"],
             "orientation_protocol": mode == .table ? "screen down on table"
-                : "screen against chest, phone upright (diaphragm area: upright or sideways); iOS reports minus the acceleration, so +z = out of chest",
+                : "screen against chest, turned as the site expects (placement_turn); iOS reports minus the acceleration, so +z = out of chest",
             "gravity_at_start": gravityAtStart,
             "orientation": mode == .table ? "screen down" : Recorder.orientationName(gravityAtStart),
             "tilt": tiltInfo(gravityAtStart),
@@ -562,7 +702,7 @@ final class Recorder: ObservableObject {
         summary = rows
         recordings = SessionStore.list()
         if mode == .chest && placementTest {
-            placement = recordPlacement == .sternum ? .diaphragm : .sternum
+            placement = recordPlacement == .sternum ? testSite : .sternum
         }
         phase = .done
         UINotificationFeedbackGenerator().notificationOccurred(.success)

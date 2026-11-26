@@ -175,7 +175,7 @@ final class FastSensorTest: ObservableObject {
         let support = batchedSupport()
         summary = [
             "test": "fast motion-data test (0.4.1 plan, section A)",
-            "app": "HC Capture 0.4.1",
+            "app": "HC Capture \(AppInfo.version)",
             "device_model": SessionStore.modelIdentifier,
             "os_version": UIDevice.current.systemVersion,
             "created_local": ISO8601DateFormatter().string(from: Date()),

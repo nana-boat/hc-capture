@@ -59,8 +59,23 @@ limits (10 ms) were set after seeing session 1 and session 2 (see the change his
 recording uses the 1–20 Hz check too, so a recording where the filters disagree carries on to 60 s.
 
 ## Flags (the recording doesn't count)
-Finger too dark at the start; the saved colour fails its quality check; the phone not upright (diaphragm area:
-not upright and not sideways).
+Finger too dark at the start; the saved colour fails its quality check; the phone not in the turn its site
+expects (version 2.2 table below).
+
+## Sites and turns (version 2.2, app 0.4.2)
+| Code | Site | Turn |
+|---|---|---|
+| `sternum` | lower breastbone (reference) | upright |
+| `sternum_sideways` | lower breastbone, sideways | sideways |
+| `left_clavicle` | below the left collarbone | sideways |
+| `manubrium` | top of the breastbone | sideways |
+| `right_clavicle` | below the right collarbone | sideways |
+| `mid_sternum` | mid-breastbone | upright |
+| `diaphragm` | diaphragm area (old test) | upright or sideways |
+
+Upright: gravity y below -0.6 and |x| below 0.5. Sideways: |x| 0.6 or more and |y| below 0.5. The grade never uses
+the turn (the chest signal is the out-of-chest axis, z), so nothing else changes. The site test is judged on the
+laptop by its own fingerprinted rules (site test rules v1), not by this app.
 
 ## Pass marks for the next 5 lower-breastbone recordings (set in advance, unchanged from version 2)
 - Good in at least 4 of 5
@@ -89,3 +104,7 @@ or a population calibration is used has not been decided; nothing here depends o
   cannot test them): Good 6 of 14 (version 2: 10 of 14). 1538, 1540, 1544 become Weak (filters disagree by about
   52 ms); 1723 becomes Weak (first 45 s 136.3 vs 118.1 ms). PTT medians move by 0.3 ms or less.
   Recordings 1716, 1718 and 1725 pass the 1–20 Hz check by 7–9 ms, close to the 10 ms limit.
+- **Version 2.2** (app 0.4.2, written 26 Nov 2026 before any site-test recording): adds the turn table above for
+  the site-test sites. The grade, filters, heartbeat check and PTT are unchanged. App 0.4.2 also adds the site
+  picker, alternation of any test site with the lower breastbone, a get-ready checklist saved in meta.json
+  (information only), and a simpler look. Camera, motion capture and saving code are unchanged from 0.4.1.

@@ -473,7 +473,7 @@ struct CompareRow: View {
         if let t = r.tap { return "tap: offset \(fmt(t.offsetMedianMs)) ms, SD \(fmt(t.offsetSdMs)) ms, \(t.paired) taps" }
         var s = (r.isFlagged ? "⚑ flagged · " : "") + "\(r.mode)"
         if let g = r.grade { s += g.good ? " · Good" : " · Weak" }
-        if r.placement == "diaphragm" { s += " · diaphragm" }
+        if let p = r.placement, p != "sternum" { s += " · " + (BodyPlacement(rawValue: p)?.short ?? p) }
         s += " · HR \(fmt(r.hrPpg, "%.0f")) · ratio \(fmt(r.bestLock))" + (r.version < 3 ? " (old analysis)" : "")
         if r.mode == "chest", let f = r.fixed {
             s += " · PTT \(fmt(f.pttMedianMs, "%.0f")) ± \(fmt(f.pttRobustSdMs, "%.0f")) ms"
@@ -524,7 +524,11 @@ struct CompareView: View {
     func goodPTT(_ rs: [AnalysisResult]) -> [Double] {
         rs.filter { $0.grade?.good == true }.compactMap { $0.grade?.pttMedianMs }.filter { $0.isFinite }
     }
-    var placementDiff: Double { DSP.mean(goodPTT(placementRows("diaphragm"))) - DSP.mean(goodPTT(placementRows("sternum"))) }
+    /// Test sites present in the usable recordings (0.4.2 site test).
+    var testPlacements: [String] {
+        Array(Set(chestUsable.compactMap { $0.placement }.filter { $0 != "sternum" })).sorted()
+    }
+    func placementDiff(_ p: String) -> Double { DSP.mean(goodPTT(placementRows(p))) - DSP.mean(goodPTT(placementRows("sternum"))) }
     var pttMedians: [Double] { detected.compactMap { $0.fixed?.pttMedianMs }.filter { $0.isFinite } }
     var pttWithin: [Double] { detected.compactMap { $0.fixed?.pttRobustSdMs }.filter { $0.isFinite } }
     var tapOffsets: [Double] { results.compactMap { $0.tap?.offsetMedianMs }.filter { $0.isFinite } }
@@ -554,12 +558,13 @@ struct CompareView: View {
                 Text("Lower breastbone only, fixed method, only recordings graded Good. Pass marks set in advance: Good in at least 4 of 5, spread within each 10 ms or less, spread between recordings 15 ms or less.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            Section("Placement test") {
-                ForEach(["sternum", "diaphragm"], id: \.self) { p in
+            Section("Site test") {
+                PlacementSummary(name: "Lower breastbone (reference)", rows: placementRows("sternum"))
+                ForEach(testPlacements, id: \.self) { p in
                     PlacementSummary(name: Analyzer.placementName(p).capitalized, rows: placementRows(p))
+                    ResultLine(label: "PTT difference vs breastbone", value: "\(fmt(placementDiff(p), "%+.0f")) ms", ok: nil)
                 }
-                ResultLine(label: "PTT difference (diaphragm − breastbone)", value: "\(fmt(placementDiff, "%+.0f")) ms", ok: nil)
-                Text("If the diaphragm area works, it should give mostly Good recordings and a PTT within a few ms of the breastbone. A clearly different PTT means it picks up something else (for example the pulse of the main artery). Judgement, not proof: needs several recordings at each place.")
+                Text("Quick look only. Each site may keep its own steady distance from the breastbone; the site test is judged on the laptop (rules v1) from paired recordings.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Tap sync") {
